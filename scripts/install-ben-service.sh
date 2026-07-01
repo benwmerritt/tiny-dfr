@@ -27,9 +27,39 @@ if [[ ! -f "$config_src" ]]; then
   exit 1
 fi
 
+find_touchbar_drm_card() {
+  local card driver
+  for card in /sys/class/drm/card[0-9]*; do
+    [[ -e "$card" ]] || continue
+    driver="$card/device/driver"
+    [[ -e "$driver" ]] || continue
+    if [[ "$(basename "$(readlink -f "$driver")")" == "appletbdrm" ]]; then
+      printf '/dev/dri/%s\n' "$(basename "$card")"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! touchbar_card="$(find_touchbar_drm_card)"; then
+  cat >&2 <<'EOF'
+No appletbdrm Touch Bar DRM card is present.
+
+Refusing to stop or switch services because tiny-dfr would otherwise scan the
+normal i915 display card and fail with "Device or resource busy" while Niri owns it.
+This usually means the Touch Bar USB display did not come back in DFR mode after
+suspend/resume. Use the safe path: reboot and retry once /dev/dri/card* includes
+an appletbdrm card. Do not force-switch USB config from this script.
+EOF
+  exit 1
+fi
+
+echo "Found Touch Bar DRM device: $touchbar_card"
+
 rollback_to_stock() {
   echo "Rolling back to stock tiny-dfr.service" >&2
   systemctl disable --now tiny-dfr-ben.service || true
+  systemctl reset-failed tiny-dfr-ben.service tiny-dfr.service || true
   systemctl enable --now tiny-dfr.service
 }
 
@@ -69,7 +99,7 @@ WantedBy=graphical.target
 EOF
 
 systemctl daemon-reload
-systemctl reset-failed tiny-dfr-ben.service || true
+systemctl reset-failed tiny-dfr-ben.service tiny-dfr.service || true
 
 # tiny-dfr owns the Touch Bar DRM/input/uinput devices, so only one instance
 # should run at a time.
@@ -85,6 +115,10 @@ else
   echo "tiny-dfr-ben failed to become active." >&2
   systemctl --no-pager --lines=50 status tiny-dfr-ben.service || true
   rollback_to_stock
+  if ! systemctl is-active --quiet tiny-dfr.service; then
+    echo "Stock tiny-dfr did not become active either; a reboot is the safest recovery." >&2
+    systemctl --no-pager --lines=50 status tiny-dfr.service || true
+  fi
   exit 1
 fi
 
