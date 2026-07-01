@@ -936,10 +936,17 @@ impl FunctionLayer {
             .map(|(_, button)| button.action.clone())
     }
 
-    fn mark_visible_set_changed_and_unpressed(&mut self) {
+    fn mark_visible_set_changed(&mut self) {
         for (_, button) in &mut self.visible_mut().buttons {
             button.changed = true;
-            button.pressed = false;
+            // Never force-clear `pressed` here: that would bypass set_active
+            // and turn a later release into a silent no-op, stranding the
+            // uinput key forever. Under the drain discipline a set becoming
+            // visible has always been released already.
+            debug_assert!(
+                !button.pressed,
+                "button set became visible with a key still down"
+            );
         }
     }
 
@@ -952,14 +959,14 @@ impl FunctionLayer {
         }
         self.overlay_stack.push(name.to_string());
         self.overlay_anchor = Some(Instant::now());
-        self.mark_visible_set_changed_and_unpressed();
+        self.mark_visible_set_changed();
         true
     }
 
     fn close_top_overlay(&mut self) -> bool {
         if self.overlay_stack.pop().is_some() {
             self.overlay_anchor = self.has_open_overlay().then(Instant::now);
-            self.mark_visible_set_changed_and_unpressed();
+            self.mark_visible_set_changed();
             true
         } else {
             false
@@ -972,7 +979,7 @@ impl FunctionLayer {
         }
         self.overlay_stack.clear();
         self.overlay_anchor = None;
-        self.mark_visible_set_changed_and_unpressed();
+        self.mark_visible_set_changed();
         true
     }
 
@@ -1785,6 +1792,9 @@ fn drain_touches<K, F>(
         if let Some(button) = layers[layer].button_mut_in_set(&set, btn) {
             button.set_active(uinput, false);
         }
+        // An unresolvable set here must only ever hold already-released
+        // entries: any path that makes a set unreachable (strip generation
+        // bump, config reload) is required to drain BEFORE the change.
     }
 }
 
@@ -2032,11 +2042,25 @@ fn real_main(drm: &mut DrmBackend) {
                                         layers[active_layer].close_all_overlays();
                                         needs_complete_redraw = true;
                                     }
-                                    touches.insert(dn.seat_slot(), (active_layer, button_set, btn));
-                                    let (layer, button_set, btn) =
-                                        touches.get(&dn.seat_slot()).unwrap().clone();
+                                    // libinput guarantees per-slot Down/Up
+                                    // pairing, but don't let a duplicate Down
+                                    // overwrite a live entry with its key
+                                    // still down.
+                                    if let Some((old_layer, old_set, old_btn)) =
+                                        touches.remove(&dn.seat_slot())
+                                    {
+                                        if let Some(button) =
+                                            layers[old_layer].button_mut_in_set(&old_set, old_btn)
+                                        {
+                                            button.set_active(&mut uinput, false);
+                                        }
+                                    }
+                                    touches.insert(
+                                        dn.seat_slot(),
+                                        (active_layer, button_set.clone(), btn),
+                                    );
                                     if let Some(button) =
-                                        layers[layer].button_mut_in_set(&button_set, btn)
+                                        layers[active_layer].button_mut_in_set(&button_set, btn)
                                     {
                                         button.set_active(&mut uinput, true);
                                     }
