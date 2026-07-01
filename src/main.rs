@@ -67,6 +67,8 @@ const TIMEOUT_MS: i32 = 10 * 1000;
 // Slider geometry (bar draws 42px tall button band on 60px height).
 const SLIDER_TRACK_INSET_PX: f64 = 30.0;
 const SLIDER_KNOB_RADIUS_PX: f64 = 14.0;
+// Dark groove reading against the BUTTON_COLOR_INACTIVE (0.200) container.
+const SLIDER_TRACK_COLOR: f64 = 0.10;
 // Minimum interval between slider value emissions during a drag.
 const SLIDER_EMIT_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -742,7 +744,7 @@ impl Button {
                 let value = state.value.clamp(0.0, 1.0);
                 let knob_x = track_left + track_len * value;
 
-                c.set_source_rgb(0.25, 0.25, 0.25);
+                c.set_source_rgb(SLIDER_TRACK_COLOR, SLIDER_TRACK_COLOR, SLIDER_TRACK_COLOR);
                 draw_pill(
                     c,
                     track_left,
@@ -1538,9 +1540,9 @@ fn draw_button_set(
             );
             c.fill().unwrap();
         }
-        // Sliders and spacers get no rounded-rect button fill; the slider
-        // paints its own track/knob.
-        if !matches!(button.image, ButtonImage::Spacer | ButtonImage::Slider(_)) {
+        // Only spacers go without the rounded-rect button body; sliders draw
+        // their track/knob on top of the standard container for uniformity.
+        if !matches!(button.image, ButtonImage::Spacer) {
             button.set_background_color(c, color);
             c.new_sub_path();
             let left = left_edge + radius;
