@@ -12,10 +12,14 @@ use serde::{
     de::{self, Visitor},
     Deserialize, Deserializer,
 };
-use std::{collections::HashMap, fmt, fs::read_to_string, os::fd::AsFd, time::Duration};
+use std::{
+    collections::HashMap, fmt, fs::read_to_string, os::fd::AsFd, path::PathBuf, time::Duration,
+};
 
 const USER_CFG_PATH: &str = "/etc/tiny-dfr/config.toml";
 const DEFAULT_OVERLAY_TIMEOUT_MS: u64 = 8000;
+const DEFAULT_DISPLAY_BACKLIGHT: &str = "/sys/class/backlight/intel_backlight";
+const DEFAULT_KBD_BACKLIGHT: &str = "/sys/class/leds/:white:kbd_backlight";
 
 pub struct Config {
     pub show_button_outlines: bool,
@@ -26,6 +30,19 @@ pub struct Config {
     pub double_press_switch_layers: u32,
     // Zero disables auto-close.
     pub overlay_timeout: Duration,
+    // Slider backend sysfs device directories. Fixed at process start: the
+    // write handles are opened pre-privdrop, so a runtime config reload
+    // cannot change them (the reloaded values are ignored).
+    pub display_backlight_path: PathBuf,
+    pub kbd_backlight_path: PathBuf,
+}
+
+// What an absolute-position slider button controls.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub enum SliderTarget {
+    DisplayBrightness,
+    KeyboardBrightness,
+    Volume,
 }
 
 #[derive(Deserialize)]
@@ -39,6 +56,8 @@ struct ConfigProxy {
     active_brightness: Option<u32>,
     double_press_switch_layers: Option<u32>,
     overlay_timeout_ms: Option<u64>,
+    display_backlight_path: Option<String>,
+    kbd_backlight_path: Option<String>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
     control_groups: Option<HashMap<String, Vec<ButtonConfig>>>,
@@ -147,6 +166,7 @@ pub struct ButtonConfig {
     pub action: Vec<Key>,
     pub open_overlay: Option<String>,
     pub close_overlay: Option<bool>,
+    pub slider: Option<SliderTarget>,
     pub stretch: Option<usize>,
     pub icon_width: Option<i32>,
     pub icon_height: Option<i32>,
@@ -185,6 +205,8 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         base.control_groups = user.control_groups.or(base.control_groups);
         base.workspaces = user.workspaces.or(base.workspaces);
         base.overlay_timeout_ms = user.overlay_timeout_ms.or(base.overlay_timeout_ms);
+        base.display_backlight_path = user.display_backlight_path.or(base.display_backlight_path);
+        base.kbd_backlight_path = user.kbd_backlight_path.or(base.kbd_backlight_path);
         base.active_brightness = user.active_brightness.or(base.active_brightness);
         base.double_press_switch_layers = user
             .double_press_switch_layers
@@ -227,6 +249,14 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         overlay_timeout: Duration::from_millis(
             base.overlay_timeout_ms
                 .unwrap_or(DEFAULT_OVERLAY_TIMEOUT_MS),
+        ),
+        display_backlight_path: PathBuf::from(
+            base.display_backlight_path
+                .unwrap_or_else(|| DEFAULT_DISPLAY_BACKLIGHT.into()),
+        ),
+        kbd_backlight_path: PathBuf::from(
+            base.kbd_backlight_path
+                .unwrap_or_else(|| DEFAULT_KBD_BACKLIGHT.into()),
         ),
     };
     (cfg, layers)

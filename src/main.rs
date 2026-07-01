@@ -47,21 +47,117 @@ mod display;
 mod fonts;
 mod layout;
 mod pixel_shift;
+mod sliders;
 
 use crate::config::ConfigManager;
 use backlight::BacklightManager;
-use config::{ButtonConfig, Config, WorkspacesCfg};
+use config::{ButtonConfig, Config, SliderTarget, WorkspacesCfg};
 use display::DrmBackend;
 use layout::{
     button_spans, controls_region, hit_index, strip_region, ButtonSpan, LayoutSpec, RegionGeometry,
     CONTROL_SPACING_PX as BUTTON_SPACING_PX, STRIP_SPACING_PX,
 };
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
+use sliders::SliderBackends;
 
 const BUTTON_COLOR_INACTIVE: f64 = 0.200;
 const BUTTON_COLOR_ACTIVE: f64 = 0.400;
 const DEFAULT_ICON_SIZE: i32 = 48;
 const TIMEOUT_MS: i32 = 10 * 1000;
+// Slider geometry (bar draws 42px tall button band on 60px height).
+const SLIDER_TRACK_INSET_PX: f64 = 30.0;
+const SLIDER_KNOB_RADIUS_PX: f64 = 14.0;
+// Minimum interval between slider value emissions during a drag.
+const SLIDER_EMIT_INTERVAL: Duration = Duration::from_millis(50);
+
+// A horizontal pill (rounded-ends rectangle) path; caller fills.
+fn draw_pill(c: &Context, x: f64, y: f64, width: f64, height: f64) {
+    use std::f64::consts::PI;
+    let r = height / 2.0;
+    let width = width.max(height);
+    c.new_sub_path();
+    c.arc(x + width - r, y + r, r, 1.5 * PI, 2.5 * PI);
+    c.arc(x + r, y + r, r, 0.5 * PI, 1.5 * PI);
+    c.close_path();
+}
+
+// Map an absolute touch x to a slider value over the button span's track.
+fn slider_value_from_x(span_left: f64, span_width: f64, x: f64) -> f64 {
+    if !x.is_finite() {
+        return 0.0;
+    }
+    let track_left = span_left + SLIDER_TRACK_INSET_PX;
+    let track_len = (span_width - 2.0 * SLIDER_TRACK_INSET_PX).max(1.0);
+    ((x - track_left) / track_len).clamp(0.0, 1.0)
+}
+
+// Latest-wins rate limiter for slider emissions: at most one value per
+// interval flows to sysfs/socket while a drag is in flight; the final value
+// is always flushed on release.
+struct EmitThrottle {
+    last_emit: Option<Instant>,
+    pending: Option<(SliderTarget, f64)>,
+}
+
+impl EmitThrottle {
+    fn new() -> EmitThrottle {
+        EmitThrottle {
+            last_emit: None,
+            pending: None,
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.last_emit
+            .is_none_or(|last| now.saturating_duration_since(last) >= SLIDER_EMIT_INTERVAL)
+    }
+
+    // Offer a new value: emitted immediately when due, otherwise stored
+    // (replacing any older pending value).
+    fn offer(
+        &mut self,
+        target: SliderTarget,
+        value: f64,
+        now: Instant,
+    ) -> Option<(SliderTarget, f64)> {
+        if self.due(now) {
+            self.last_emit = Some(now);
+            self.pending = None;
+            Some((target, value))
+        } else {
+            self.pending = Some((target, value));
+            None
+        }
+    }
+
+    // Emit the stored value once the interval has elapsed.
+    fn take_due(&mut self, now: Instant) -> Option<(SliderTarget, f64)> {
+        if self.pending.is_some() && self.due(now) {
+            self.last_emit = Some(now);
+            self.pending.take()
+        } else {
+            None
+        }
+    }
+
+    // Unconditional flush (drag ended: the final position always lands).
+    fn flush(&mut self) -> Option<(SliderTarget, f64)> {
+        self.pending.take()
+    }
+
+    // How long the event loop may sleep before a pending value is due.
+    fn pending_wait_ms(&self, now: Instant) -> Option<i32> {
+        self.pending.as_ref()?;
+        let last = self.last_emit?;
+        let elapsed = now.saturating_duration_since(last);
+        Some(
+            SLIDER_EMIT_INTERVAL
+                .saturating_sub(elapsed)
+                .as_millis()
+                .max(1) as i32,
+        )
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BatteryState {
@@ -92,12 +188,20 @@ impl BatteryIconMode {
     }
 }
 
+// Drag state of an absolute-position slider button.
+#[derive(Clone, Copy, Debug, Default)]
+struct SliderState {
+    value: f64, // 0.0..=1.0
+    dragging: bool,
+}
+
 enum ButtonImage {
     Text(String),
     Svg(Handle),
     Bitmap(ImageSurface),
     Time(Vec<ChronoItem<'static>>, Locale),
     Battery(String, BatteryIconMode, BatteryImages),
+    Slider(SliderState),
     Spacer,
 }
 
@@ -106,12 +210,15 @@ enum ButtonAction {
     Keys(Vec<Key>),
     OpenOverlay(String),
     CloseOverlay,
+    Slider(SliderTarget),
     None,
 }
 
 impl ButtonAction {
     fn from_config(cfg: &ButtonConfig) -> ButtonAction {
-        if let Some(name) = &cfg.open_overlay {
+        if let Some(target) = cfg.slider {
+            ButtonAction::Slider(target)
+        } else if let Some(name) = &cfg.open_overlay {
             ButtonAction::OpenOverlay(name.clone())
         } else if cfg.close_overlay.unwrap_or(false) {
             ButtonAction::CloseOverlay
@@ -125,7 +232,10 @@ impl ButtonAction {
     fn keys(&self) -> &[Key] {
         match self {
             ButtonAction::Keys(keys) => keys,
-            ButtonAction::OpenOverlay(_) | ButtonAction::CloseOverlay | ButtonAction::None => &[],
+            ButtonAction::OpenOverlay(_)
+            | ButtonAction::CloseOverlay
+            | ButtonAction::Slider(_)
+            | ButtonAction::None => &[],
         }
     }
 }
@@ -293,7 +403,9 @@ impl Button {
     fn with_config(cfg: ButtonConfig) -> Button {
         let id = cfg.id.clone();
         let action = ButtonAction::from_config(&cfg);
-        let mut button = if let Some(text) = cfg.text {
+        let mut button = if cfg.slider.is_some() {
+            Button::new_slider(action)
+        } else if let Some(text) = cfg.text {
             Button::new_text(text, action)
         } else if let Some(icon) = cfg.icon {
             Button::new_icon(
@@ -339,6 +451,24 @@ impl Button {
             image: ButtonImage::Text(text),
             icon_width: 0.0,
             icon_height: 0.0,
+        }
+    }
+    fn new_slider(action: ButtonAction) -> Button {
+        Button {
+            id: None,
+            action,
+            pressed: false,
+            highlighted: false,
+            changed: false,
+            image: ButtonImage::Slider(SliderState::default()),
+            icon_width: 0.0,
+            icon_height: 0.0,
+        }
+    }
+    fn slider_state_mut(&mut self) -> Option<&mut SliderState> {
+        match &mut self.image {
+            ButtonImage::Slider(state) => Some(state),
+            _ => None,
         }
     }
     fn new_icon(
@@ -573,6 +703,48 @@ impl Button {
                     );
                     c.show_text(&percent_str).unwrap();
                 }
+            }
+            ButtonImage::Slider(state) => {
+                let span_width = button_width as f64;
+                let track_left = button_left_edge + SLIDER_TRACK_INSET_PX;
+                let track_len = (span_width - 2.0 * SLIDER_TRACK_INSET_PX).max(1.0);
+                let cy = y_shift + (height as f64 / 2.0).round();
+                let track_half_height = 3.0;
+                let value = state.value.clamp(0.0, 1.0);
+                let knob_x = track_left + track_len * value;
+
+                c.set_source_rgb(0.25, 0.25, 0.25);
+                draw_pill(
+                    c,
+                    track_left,
+                    cy - track_half_height,
+                    track_len,
+                    2.0 * track_half_height,
+                );
+                c.fill().unwrap();
+
+                if value > 0.0 {
+                    c.set_source_rgb(0.85, 0.85, 0.85);
+                    draw_pill(
+                        c,
+                        track_left,
+                        cy - track_half_height,
+                        track_len * value,
+                        2.0 * track_half_height,
+                    );
+                    c.fill().unwrap();
+                }
+
+                c.set_source_rgb(1.0, 1.0, 1.0);
+                c.new_sub_path();
+                c.arc(
+                    knob_x,
+                    cy,
+                    SLIDER_KNOB_RADIUS_PX,
+                    0.0,
+                    std::f64::consts::TAU,
+                );
+                c.fill().unwrap();
             }
             ButtonImage::Spacer => (),
         }
@@ -936,6 +1108,106 @@ impl FunctionLayer {
             .map(|(_, button)| button.action.clone())
     }
 
+    fn slider_target_at(&self, key: &ButtonSetKey, index: usize) -> Option<SliderTarget> {
+        match self.button_action_in_set(key, index) {
+            Some(ButtonAction::Slider(target)) => Some(target),
+            _ => None,
+        }
+    }
+
+    // Mutate a slider button's drag state; marks it changed when the value
+    // moved or the drag phase flipped.
+    fn update_slider(
+        &mut self,
+        key: &ButtonSetKey,
+        index: usize,
+        value: Option<f64>,
+        dragging: bool,
+    ) {
+        if let Some(button) = self.button_mut_in_set(key, index) {
+            if let Some(state) = button.slider_state_mut() {
+                let mut changed = false;
+                if let Some(value) = value {
+                    if state.value != value {
+                        state.value = value;
+                        changed = true;
+                    }
+                }
+                if state.dragging != dragging {
+                    state.dragging = dragging;
+                    changed = true;
+                }
+                if changed {
+                    button.changed = true;
+                }
+            }
+        }
+    }
+
+    // Absolute (left_edge, width) of a button's span, matching hit geometry
+    // (no pixel shift). Used to map drag x-coordinates to slider values.
+    fn button_span_abs(
+        &self,
+        key: &ButtonSetKey,
+        index: usize,
+        bar_width: i32,
+    ) -> Option<(f64, f64)> {
+        let button_set = self.button_set(key)?;
+        let button_starts = button_set.button_starts();
+        let (total_width, spacing_px, origin) = match (self.kind, key) {
+            (LayerKind::Regions, ButtonSetKey::Strip(_)) => {
+                let geo = strip_region(button_set.buttons.len());
+                (geo.width, STRIP_SPACING_PX, geo.origin)
+            }
+            (LayerKind::Regions, _) => {
+                let geo = self.controls_geometry(button_set, bar_width);
+                (geo.width, BUTTON_SPACING_PX, geo.origin)
+            }
+            (LayerKind::Classic, _) => (bar_width, BUTTON_SPACING_PX, 0.0),
+        };
+        button_spans(LayoutSpec {
+            button_starts: &button_starts,
+            virtual_button_count: button_set.virtual_button_count,
+            total_width,
+            spacing_px,
+            x_offset: origin,
+        })
+        .into_iter()
+        .find(|span| span.index == index)
+        .map(|span| (span.left_edge, span.width))
+    }
+
+    // Seed the visible set's sliders from their backends so the widget always
+    // reflects reality when an overlay opens. Never touches a mid-drag slider.
+    fn sync_sliders(&mut self, backends: &SliderBackends) {
+        let key = self.controls_key();
+        let Some(set) = self.button_set_mut(&key) else {
+            return;
+        };
+        for (_, button) in &mut set.buttons {
+            let target = match &button.action {
+                ButtonAction::Slider(target) => *target,
+                _ => continue,
+            };
+            let value = match target {
+                SliderTarget::DisplayBrightness => {
+                    backends.display.as_ref().and_then(|s| s.read_value())
+                }
+                SliderTarget::KeyboardBrightness => {
+                    backends.keyboard.as_ref().and_then(|s| s.read_value())
+                }
+                // Volume state arrives over the control socket (M4).
+                SliderTarget::Volume => None,
+            };
+            if let (Some(value), Some(state)) = (value, button.slider_state_mut()) {
+                if !state.dragging && state.value != value {
+                    state.value = value;
+                    button.changed = true;
+                }
+            }
+        }
+    }
+
     fn mark_visible_set_changed(&mut self) {
         for (_, button) in &mut self.visible_mut().buttons {
             button.changed = true;
@@ -1004,7 +1276,8 @@ impl FunctionLayer {
         match action {
             ButtonAction::OpenOverlay(name) => self.open_overlay(&name),
             ButtonAction::CloseOverlay => self.close_top_overlay(),
-            ButtonAction::Keys(_) | ButtonAction::None => false,
+            // Sliders act during the drag, never on release.
+            ButtonAction::Keys(_) | ButtonAction::Slider(_) | ButtonAction::None => false,
         }
     }
 
@@ -1236,7 +1509,9 @@ fn draw_button_set(
             );
             c.fill().unwrap();
         }
-        if !matches!(button.image, ButtonImage::Spacer) {
+        // Sliders and spacers get no rounded-rect button fill; the slider
+        // paints its own track/knob.
+        if !matches!(button.image, ButtonImage::Spacer | ButtonImage::Slider(_)) {
             button.set_background_color(c, color);
             c.new_sub_path();
             let left = left_edge + radius;
@@ -1303,7 +1578,7 @@ mod function_layer_tests {
             ButtonAction::Keys(keys) => (None, None, keys),
             ButtonAction::OpenOverlay(name) => (Some(name), None, vec![]),
             ButtonAction::CloseOverlay => (None, Some(true), vec![]),
-            ButtonAction::None => (None, None, vec![]),
+            ButtonAction::Slider(_) | ButtonAction::None => (None, None, vec![]),
         };
         ButtonConfig {
             text: Some(text.to_string()),
@@ -1677,6 +1952,166 @@ mod function_layer_tests {
     }
 
     #[test]
+    fn slider_config_takes_precedence_over_keys_and_overlay() {
+        let cfg: ButtonConfig = toml::from_str(
+            r#"Slider = "DisplayBrightness"
+Action = "VolumeUp"
+OpenOverlay = "volume""#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ButtonAction::from_config(&cfg),
+            ButtonAction::Slider(SliderTarget::DisplayBrightness)
+        );
+    }
+
+    #[test]
+    fn slider_action_never_changes_overlay_state() {
+        let mut layer = nested_layer();
+        assert!(layer.open_overlay("sound"));
+
+        assert!(!layer.activate_button_action(ButtonAction::Slider(SliderTarget::Volume)));
+
+        assert_eq!(
+            layer.controls_key(),
+            ButtonSetKey::Overlay("sound".to_string())
+        );
+    }
+
+    #[test]
+    fn slider_value_mapping_clamps_and_respects_track_inset() {
+        let (left, width) = (100.0, 488.0);
+        let track_left = left + SLIDER_TRACK_INSET_PX;
+        let track_len = width - 2.0 * SLIDER_TRACK_INSET_PX;
+
+        assert_eq!(slider_value_from_x(left, width, track_left), 0.0);
+        assert_eq!(
+            slider_value_from_x(left, width, track_left + track_len / 2.0),
+            0.5
+        );
+        assert_eq!(
+            slider_value_from_x(left, width, track_left + track_len),
+            1.0
+        );
+        assert_eq!(slider_value_from_x(left, width, -500.0), 0.0);
+        assert_eq!(slider_value_from_x(left, width, 5000.0), 1.0);
+        assert_eq!(slider_value_from_x(left, width, f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn throttle_emits_at_most_every_interval_and_flushes_final() {
+        let mut throttle = EmitThrottle::new();
+        let t0 = Instant::now();
+
+        assert_eq!(
+            throttle.offer(SliderTarget::Volume, 0.1, t0),
+            Some((SliderTarget::Volume, 0.1))
+        );
+        assert_eq!(
+            throttle.offer(SliderTarget::Volume, 0.2, t0 + Duration::from_millis(10)),
+            None
+        );
+        assert_eq!(throttle.take_due(t0 + Duration::from_millis(20)), None);
+        assert_eq!(
+            throttle.take_due(t0 + Duration::from_millis(60)),
+            Some((SliderTarget::Volume, 0.2))
+        );
+        // Final flush is unconditional.
+        assert_eq!(
+            throttle.offer(SliderTarget::Volume, 0.3, t0 + Duration::from_millis(70)),
+            None
+        );
+        assert_eq!(throttle.flush(), Some((SliderTarget::Volume, 0.3)));
+        assert_eq!(throttle.flush(), None);
+    }
+
+    fn slider_layer() -> FunctionLayer {
+        let mut groups = HashMap::new();
+        groups.insert(
+            "bright".to_string(),
+            vec![ButtonConfig {
+                slider: Some(SliderTarget::DisplayBrightness),
+                stretch: Some(4),
+                ..Default::default()
+            }],
+        );
+        FunctionLayer::with_config(
+            vec![text_button(
+                "open",
+                ButtonAction::OpenOverlay("bright".to_string()),
+            )],
+            groups,
+            Some(&ws_cfg(1)),
+        )
+    }
+
+    fn fake_backlight_dir(max: &str, current: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "tiny-dfr-main-slider-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("max_brightness"), max).unwrap();
+        fs::write(dir.join("brightness"), current).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sync_sliders_seeds_visible_slider_from_backend() {
+        let mut layer = slider_layer();
+        let dir = fake_backlight_dir("1000\n", "250\n");
+        let missing = std::env::temp_dir().join("tiny-dfr-main-slider-missing");
+        let backends = SliderBackends::new(&dir, &missing);
+        assert!(layer.open_overlay("bright"));
+
+        layer.sync_sliders(&backends);
+
+        let key = ButtonSetKey::Overlay("bright".to_string());
+        let button = layer.button_mut_in_set(&key, 0).unwrap();
+        let state = button.slider_state_mut().unwrap();
+        assert_eq!(state.value, 0.25);
+        assert!(!state.dragging);
+    }
+
+    #[test]
+    fn sync_sliders_never_touches_a_mid_drag_slider() {
+        let mut layer = slider_layer();
+        let dir = fake_backlight_dir("1000\n", "250\n");
+        let missing = std::env::temp_dir().join("tiny-dfr-main-slider-missing");
+        let backends = SliderBackends::new(&dir, &missing);
+        assert!(layer.open_overlay("bright"));
+        let key = ButtonSetKey::Overlay("bright".to_string());
+        layer.update_slider(&key, 0, Some(0.9), true);
+
+        layer.sync_sliders(&backends);
+
+        let button = layer.button_mut_in_set(&key, 0).unwrap();
+        assert_eq!(button.slider_state_mut().unwrap().value, 0.9);
+    }
+
+    #[test]
+    fn update_slider_marks_button_changed_on_value_or_phase_change() {
+        let mut layer = slider_layer();
+        assert!(layer.open_overlay("bright"));
+        let key = ButtonSetKey::Overlay("bright".to_string());
+        layer.button_mut_in_set(&key, 0).unwrap().changed = false;
+
+        layer.update_slider(&key, 0, Some(0.4), true);
+        assert!(layer.button_mut_in_set(&key, 0).unwrap().changed);
+
+        layer.button_mut_in_set(&key, 0).unwrap().changed = false;
+        layer.update_slider(&key, 0, Some(0.4), true);
+        assert!(!layer.button_mut_in_set(&key, 0).unwrap().changed);
+
+        layer.update_slider(&key, 0, None, false);
+        assert!(layer.button_mut_in_set(&key, 0).unwrap().changed);
+    }
+
+    #[test]
     fn classic_layer_has_no_strip_targets() {
         let layer = FunctionLayer::with_config(
             vec![text_button("a", ButtonAction::None)],
@@ -1776,6 +2211,24 @@ where
     );
 }
 
+fn emit_slider(target: SliderTarget, value: f64, backends: &mut SliderBackends) {
+    match target {
+        SliderTarget::DisplayBrightness => {
+            if let Some(slider) = backends.display.as_mut() {
+                slider.write_value(value);
+            }
+        }
+        SliderTarget::KeyboardBrightness => {
+            if let Some(slider) = backends.keyboard.as_mut() {
+                slider.write_value(value);
+            }
+        }
+        // Volume flows as a typed intent over the control socket (M4);
+        // dropped silently until that lands.
+        SliderTarget::Volume => {}
+    }
+}
+
 // The single invalidation path for the touch map: every route that hides or
 // replaces buttons (overlay transitions, timeout close, layer flips, config
 // reloads) must release in-flight touches through here so no virtual key is
@@ -1833,6 +2286,12 @@ fn real_main(drm: &mut DrmBackend) {
     let (mut cfg, mut layers) = cfg_mgr.load_config(width);
     let mut pixel_shift = PixelShiftManager::new();
     let mut last = Instant::now();
+    // Slider write handles need root: open them before the privilege drop
+    // below (same pattern as BacklightManager). Paths are fixed for the
+    // process lifetime; config reloads cannot change them.
+    let mut slider_backends =
+        SliderBackends::new(&cfg.display_backlight_path, &cfg.kbd_backlight_path);
+    let mut slider_throttle = EmitThrottle::new();
 
     // drop privileges to input and video group
     let groups = ["input", "video"];
@@ -1936,6 +2395,18 @@ fn real_main(drm: &mut DrmBackend) {
                 if layers[active_layer].close_all_overlays() {
                     needs_complete_redraw = true;
                 }
+            }
+        }
+
+        // Flush a rate-limited slider value once its interval elapses, and
+        // keep the epoll wait short enough to deliver it.
+        {
+            let now = Instant::now();
+            if let Some((target, value)) = slider_throttle.take_due(now) {
+                emit_slider(target, value, &mut slider_backends);
+            }
+            if let Some(wait_ms) = slider_throttle.pending_wait_ms(now) {
+                next_timeout_ms = min(next_timeout_ms, wait_ms);
             }
         }
 
@@ -2050,14 +2521,51 @@ fn real_main(drm: &mut DrmBackend) {
                                             button.set_active(&mut uinput, false);
                                         }
                                     }
-                                    touches.insert(
-                                        dn.seat_slot(),
-                                        (active_layer, button_set.clone(), btn),
-                                    );
-                                    if let Some(button) =
-                                        layers[active_layer].button_mut_in_set(&button_set, btn)
+                                    if let Some(target) =
+                                        layers[active_layer].slider_target_at(&button_set, btn)
                                     {
-                                        button.set_active(&mut uinput, true);
+                                        // First finger owns the slider; extra
+                                        // touches on it are ignored entirely.
+                                        let already_owned =
+                                            touches.values().any(|(layer, set, index)| {
+                                                *layer == active_layer
+                                                    && set == &button_set
+                                                    && *index == btn
+                                            });
+                                        if !already_owned {
+                                            let value = layers[active_layer]
+                                                .button_span_abs(&button_set, btn, width as i32)
+                                                .map(|(left, w)| slider_value_from_x(left, w, x));
+                                            touches.insert(
+                                                dn.seat_slot(),
+                                                (active_layer, button_set.clone(), btn),
+                                            );
+                                            if let Some(value) = value {
+                                                layers[active_layer].update_slider(
+                                                    &button_set,
+                                                    btn,
+                                                    Some(value),
+                                                    true,
+                                                );
+                                                if let Some((t, v)) = slider_throttle.offer(
+                                                    target,
+                                                    value,
+                                                    Instant::now(),
+                                                ) {
+                                                    emit_slider(t, v, &mut slider_backends);
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        touches.insert(
+                                            dn.seat_slot(),
+                                            (active_layer, button_set.clone(), btn),
+                                        );
+                                        if let Some(button) =
+                                            layers[active_layer].button_mut_in_set(&button_set, btn)
+                                        {
+                                            button.set_active(&mut uinput, true);
+                                        }
                                     }
                                 }
                                 // iPhone-folder rule: touching anywhere outside
@@ -2082,12 +2590,38 @@ fn real_main(drm: &mut DrmBackend) {
                             let y = mtn.y_transformed(height as u32);
                             let (layer, button_set, btn) =
                                 touches.get(&mtn.seat_slot()).unwrap().clone();
-                            let hit = layers[layer]
-                                .hit_in_set(width, height, x, y, &button_set, Some(btn))
-                                .is_some();
-                            if let Some(button) = layers[layer].button_mut_in_set(&button_set, btn)
-                            {
-                                button.set_active(&mut uinput, hit);
+                            if let Some(target) = layers[layer].slider_target_at(&button_set, btn) {
+                                // Drags stay bound to the slider until Up and
+                                // ignore y entirely; only x maps to a value.
+                                if layers[layer].is_set_visible(&button_set) {
+                                    if let Some((left, w)) = layers[layer].button_span_abs(
+                                        &button_set,
+                                        btn,
+                                        width as i32,
+                                    ) {
+                                        let value = slider_value_from_x(left, w, x);
+                                        layers[layer].update_slider(
+                                            &button_set,
+                                            btn,
+                                            Some(value),
+                                            true,
+                                        );
+                                        if let Some((t, v)) =
+                                            slider_throttle.offer(target, value, Instant::now())
+                                        {
+                                            emit_slider(t, v, &mut slider_backends);
+                                        }
+                                    }
+                                }
+                            } else {
+                                let hit = layers[layer]
+                                    .hit_in_set(width, height, x, y, &button_set, Some(btn))
+                                    .is_some();
+                                if let Some(button) =
+                                    layers[layer].button_mut_in_set(&button_set, btn)
+                                {
+                                    button.set_active(&mut uinput, hit);
+                                }
                             }
                         }
                         TouchEvent::Up(up) => {
@@ -2095,6 +2629,14 @@ fn real_main(drm: &mut DrmBackend) {
                                 continue;
                             }
                             let (layer, button_set, btn) = touches.remove(&up.seat_slot()).unwrap();
+                            if layers[layer].slider_target_at(&button_set, btn).is_some() {
+                                // Drag ended: the last position always lands.
+                                layers[layer].update_slider(&button_set, btn, None, false);
+                                if let Some((t, v)) = slider_throttle.flush() {
+                                    emit_slider(t, v, &mut slider_backends);
+                                }
+                                continue;
+                            }
                             let action = layers[layer].button_action_in_set(&button_set, btn);
                             let can_activate = layers[layer].is_set_visible(&button_set);
                             let mut hit = false;
@@ -2107,6 +2649,7 @@ fn real_main(drm: &mut DrmBackend) {
                                 if let Some(action) = action {
                                     if layers[layer].activate_button_action(action) {
                                         drain_touches(&mut layers, &mut touches, &mut uinput);
+                                        layers[layer].sync_sliders(&slider_backends);
                                         needs_complete_redraw = true;
                                     }
                                 }
@@ -2118,7 +2661,12 @@ fn real_main(drm: &mut DrmBackend) {
                             if let Some((layer, button_set, btn)) =
                                 touches.remove(&cancel.seat_slot())
                             {
-                                if let Some(button) =
+                                if layers[layer].slider_target_at(&button_set, btn).is_some() {
+                                    layers[layer].update_slider(&button_set, btn, None, false);
+                                    if let Some((t, v)) = slider_throttle.flush() {
+                                        emit_slider(t, v, &mut slider_backends);
+                                    }
+                                } else if let Some(button) =
                                     layers[layer].button_mut_in_set(&button_set, btn)
                                 {
                                     button.set_active(&mut uinput, false);
