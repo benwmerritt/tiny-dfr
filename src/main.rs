@@ -2032,16 +2032,11 @@ fn real_main(drm: &mut DrmBackend) {
                             let y = dn.y_transformed(height as u32);
                             match layers[active_layer].hit_target(width, height, x, y) {
                                 HitOutcome::Button(button_set, btn) => {
-                                    // A workspace tap while an overlay is open
-                                    // closes the whole stack AND performs the
-                                    // switch in the same tap.
-                                    if matches!(button_set, ButtonSetKey::Strip(_))
-                                        && layers[active_layer].has_open_overlay()
-                                    {
-                                        drain_touches(&mut layers, &mut touches, &mut uinput);
-                                        layers[active_layer].close_all_overlays();
-                                        needs_complete_redraw = true;
-                                    }
+                                    // Workspace taps while an overlay is open
+                                    // switch workspaces but leave the overlay
+                                    // alone (Ben's call after feeling it on
+                                    // hardware); only empty space or the idle
+                                    // timeout dismisses.
                                     // libinput guarantees per-slot Down/Up
                                     // pairing, but don't let a duplicate Down
                                     // overwrite a live entry with its key
