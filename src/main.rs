@@ -102,7 +102,8 @@ enum ButtonImage {
 struct Button {
     image: ButtonImage,
     changed: bool,
-    active: bool,
+    pressed: bool,
+    highlighted: bool,
     action: Vec<Key>,
     icon_width: f64,
     icon_height: f64,
@@ -280,7 +281,8 @@ impl Button {
     fn new_spacer() -> Button {
         Button {
             action: vec![],
-            active: false,
+            pressed: false,
+            highlighted: false,
             changed: false,
             image: ButtonImage::Spacer,
             icon_width: 0.0,
@@ -290,7 +292,8 @@ impl Button {
     fn new_text(text: String, action: Vec<Key>) -> Button {
         Button {
             action,
-            active: false,
+            pressed: false,
+            highlighted: false,
             changed: false,
             image: ButtonImage::Text(text),
             icon_width: 0.0,
@@ -311,7 +314,8 @@ impl Button {
             image,
             icon_width: icon_width as f64,
             icon_height: icon_height as f64,
-            active: false,
+            pressed: false,
+            highlighted: false,
             changed: false,
         }
     }
@@ -363,7 +367,8 @@ impl Button {
         };
         Button {
             action,
-            active: false,
+            pressed: false,
+            highlighted: false,
             changed: false,
             image: ButtonImage::Battery(
                 battery,
@@ -398,7 +403,8 @@ impl Button {
             .unwrap_or(Locale::POSIX);
         Button {
             action,
-            active: false,
+            pressed: false,
+            highlighted: false,
             changed: false,
             image: ButtonImage::Time(format_items, locale),
             icon_width: 0.0,
@@ -527,12 +533,26 @@ impl Button {
             ButtonImage::Spacer => (),
         }
     }
+    fn is_visually_active(&self) -> bool {
+        self.pressed || self.highlighted
+    }
+
+    // Used by the upcoming control socket path to update persistent visual
+    // state without emitting key events.
+    #[allow(dead_code)]
+    fn set_highlighted(&mut self, highlighted: bool) {
+        if self.highlighted != highlighted {
+            self.highlighted = highlighted;
+            self.changed = true;
+        }
+    }
+
     fn set_active<F>(&mut self, uinput: &mut UInputHandle<F>, active: bool)
     where
         F: AsRawFd,
     {
-        if self.active != active {
-            self.active = active;
+        if self.pressed != active {
+            self.pressed = active;
             self.changed = true;
 
             toggle_keys(uinput, &self.action, active as i32);
@@ -549,6 +569,47 @@ impl Button {
         } else {
             c.set_source_rgb(color, color, color);
         }
+    }
+}
+
+#[cfg(test)]
+mod button_tests {
+    use super::*;
+
+    #[test]
+    fn new_button_is_not_visually_active() {
+        let button = Button::new_text("workspace".to_string(), vec![]);
+
+        assert!(!button.is_visually_active());
+    }
+
+    #[test]
+    fn pressed_button_is_visually_active() {
+        let mut button = Button::new_text("workspace".to_string(), vec![]);
+
+        button.pressed = true;
+
+        assert!(button.is_visually_active());
+    }
+
+    #[test]
+    fn highlighted_button_is_visually_active_without_pressing_keys() {
+        let mut button = Button::new_text("workspace".to_string(), vec![]);
+
+        button.set_highlighted(true);
+
+        assert!(button.is_visually_active());
+        assert!(!button.pressed);
+    }
+
+    #[test]
+    fn setting_highlight_marks_button_changed_without_pressing_it() {
+        let mut button = Button::new_text("workspace".to_string(), vec![]);
+
+        button.set_highlighted(true);
+
+        assert!(button.changed);
+        assert!(!button.pressed);
     }
 }
 
@@ -648,7 +709,7 @@ impl FunctionLayer {
             let left_edge = span.left_edge;
             let button_width = span.width;
 
-            let color = if button.active {
+            let color = if button.is_visually_active() {
                 BUTTON_COLOR_ACTIVE
             } else if config.show_button_outlines {
                 BUTTON_COLOR_INACTIVE
