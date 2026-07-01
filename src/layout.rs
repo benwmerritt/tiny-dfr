@@ -1,3 +1,48 @@
+// Region geometry for LayerKind::Regions: a compact square workspace strip on
+// the left, free space in the middle, and a right-anchored controls region.
+// The bar draws in rotated space as roughly 2008x60 on this hardware, with a
+// 42px button band, so 60px-wide strip buttons read as squares.
+pub(crate) const STRIP_BUTTON_WIDTH_PX: i32 = 60;
+pub(crate) const STRIP_SPACING_PX: i32 = 10;
+pub(crate) const STRIP_LEFT_MARGIN_PX: f64 = 12.0;
+pub(crate) const CONTROL_UNIT_PX: i32 = 110;
+pub(crate) const CONTROL_RIGHT_MARGIN_PX: f64 = 12.0;
+pub(crate) const CONTROL_SPACING_PX: i32 = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RegionGeometry {
+    pub(crate) origin: f64,
+    pub(crate) width: i32,
+}
+
+pub(crate) fn strip_region(n_buttons: usize) -> RegionGeometry {
+    let n = n_buttons.max(1) as i32;
+    RegionGeometry {
+        origin: STRIP_LEFT_MARGIN_PX,
+        width: n * STRIP_BUTTON_WIDTH_PX + (n - 1) * STRIP_SPACING_PX,
+    }
+}
+
+// Right-anchored; never allowed to intrude into [0, min_origin) so the strip
+// stays untouched even under a pathologically wide controls config.
+pub(crate) fn controls_region(
+    virtual_count: usize,
+    bar_width: i32,
+    min_origin: f64,
+) -> RegionGeometry {
+    let n = virtual_count.max(1) as i32;
+    let width = n * CONTROL_UNIT_PX + (n - 1) * CONTROL_SPACING_PX;
+    let origin = bar_width as f64 - CONTROL_RIGHT_MARGIN_PX - width as f64;
+    if origin < min_origin {
+        let clamped_width = (bar_width as f64 - CONTROL_RIGHT_MARGIN_PX - min_origin) as i32;
+        return RegionGeometry {
+            origin: min_origin,
+            width: clamped_width.max(1),
+        };
+    }
+    RegionGeometry { origin, width }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LayoutSpec<'a> {
     pub(crate) button_starts: &'a [usize],
@@ -172,6 +217,41 @@ mod tests {
         assert_eq!(
             hit_index(spec(&starts, 4, 100), 20, 50.0, 10.0, Some(1)),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn strip_region_width_scales_with_button_count() {
+        let one = strip_region(1);
+        let four = strip_region(4);
+
+        assert_eq!(one.origin, STRIP_LEFT_MARGIN_PX);
+        assert_eq!(one.width, STRIP_BUTTON_WIDTH_PX);
+        assert_eq!(four.origin, STRIP_LEFT_MARGIN_PX);
+        assert_eq!(four.width, 4 * STRIP_BUTTON_WIDTH_PX + 3 * STRIP_SPACING_PX);
+    }
+
+    #[test]
+    fn controls_region_is_right_anchored() {
+        let geo = controls_region(2, 2008, 0.0);
+
+        let expected_width = 2 * CONTROL_UNIT_PX + CONTROL_SPACING_PX;
+        assert_eq!(geo.width, expected_width);
+        assert_eq!(
+            geo.origin,
+            2008.0 - CONTROL_RIGHT_MARGIN_PX - expected_width as f64
+        );
+    }
+
+    #[test]
+    fn controls_region_clamps_to_min_origin() {
+        let min_origin = 300.0;
+        let geo = controls_region(50, 2008, min_origin);
+
+        assert_eq!(geo.origin, min_origin);
+        assert_eq!(
+            geo.width,
+            (2008.0 - CONTROL_RIGHT_MARGIN_PX - min_origin) as i32
         );
     }
 }

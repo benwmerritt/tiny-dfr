@@ -50,12 +50,14 @@ mod pixel_shift;
 
 use crate::config::ConfigManager;
 use backlight::BacklightManager;
-use config::{ButtonConfig, Config};
+use config::{ButtonConfig, Config, WorkspacesCfg};
 use display::DrmBackend;
-use layout::{button_spans, hit_index, LayoutSpec};
+use layout::{
+    button_spans, controls_region, hit_index, strip_region, ButtonSpan, LayoutSpec, RegionGeometry,
+    CONTROL_SPACING_PX as BUTTON_SPACING_PX, STRIP_SPACING_PX,
+};
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 
-const BUTTON_SPACING_PX: i32 = 16;
 const BUTTON_COLOR_INACTIVE: f64 = 0.200;
 const BUTTON_COLOR_ACTIVE: f64 = 0.400;
 const DEFAULT_ICON_SIZE: i32 = 48;
@@ -712,10 +714,23 @@ CloseOverlay = true"#,
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LayerKind {
+    // The whole bar is one button row (stock behavior; the F-key layer).
+    #[default]
+    Classic,
+    // Pinned workspace strip on the left, free middle, right-anchored
+    // controls region that overlays swap in place of.
+    Regions,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ButtonSetKey {
     Base,
     Overlay(String),
+    // Generation-tagged so a strip rebuild invalidates in-flight touches
+    // instead of retargeting them onto different workspace buttons.
+    Strip(u64),
 }
 
 #[derive(Default)]
@@ -770,29 +785,55 @@ const MAX_OVERLAY_DEPTH: usize = 8;
 
 #[derive(Default)]
 pub struct FunctionLayer {
+    kind: LayerKind,
     base: ButtonSet,
     overlays: HashMap<String, ButtonSet>,
     overlay_stack: Vec<String>,
+    // Regions only: the pinned workspace strip. Static fallback content until
+    // live compositor state arrives over the control socket.
+    strip: ButtonSet,
+    strip_generation: u64,
+}
+
+fn fallback_strip_set(workspaces: &WorkspacesCfg) -> ButtonSet {
+    let buttons = (1..=workspaces.fallback_buttons)
+        .map(|idx| ButtonConfig {
+            text: Some(idx.to_string()),
+            action: workspaces.action_for(idx),
+            ..Default::default()
+        })
+        .collect();
+    ButtonSet::with_config(buttons)
 }
 
 impl FunctionLayer {
     fn with_config(
         cfg: Vec<ButtonConfig>,
         control_groups: HashMap<String, Vec<ButtonConfig>>,
+        workspaces: Option<&WorkspacesCfg>,
     ) -> FunctionLayer {
         let base = ButtonSet::with_config(cfg);
         let overlays = control_groups
             .into_iter()
             .map(|(name, cfg)| (name, ButtonSet::with_config(cfg)))
             .collect();
+        let (kind, strip) = match workspaces {
+            Some(ws) => (LayerKind::Regions, fallback_strip_set(ws)),
+            None => (LayerKind::Classic, ButtonSet::default()),
+        };
         FunctionLayer {
+            kind,
             base,
             overlays,
             overlay_stack: Vec::new(),
+            strip,
+            strip_generation: 0,
         }
     }
 
-    fn visible_key(&self) -> ButtonSetKey {
+    // The key of the button set currently occupying the controls region
+    // (Classic: the whole bar).
+    fn controls_key(&self) -> ButtonSetKey {
         self.overlay_stack
             .last()
             .map(|name| ButtonSetKey::Overlay(name.clone()))
@@ -803,6 +844,9 @@ impl FunctionLayer {
         match key {
             ButtonSetKey::Base => Some(&self.base),
             ButtonSetKey::Overlay(name) => self.overlays.get(name),
+            ButtonSetKey::Strip(generation) => (self.kind == LayerKind::Regions
+                && *generation == self.strip_generation)
+                .then_some(&self.strip),
         }
     }
 
@@ -810,20 +854,28 @@ impl FunctionLayer {
         match key {
             ButtonSetKey::Base => Some(&mut self.base),
             ButtonSetKey::Overlay(name) => self.overlays.get_mut(name),
+            ButtonSetKey::Strip(generation) => (self.kind == LayerKind::Regions
+                && *generation == self.strip_generation)
+                .then_some(&mut self.strip),
         }
     }
 
     fn visible(&self) -> &ButtonSet {
-        self.button_set(&self.visible_key()).unwrap()
+        self.button_set(&self.controls_key()).unwrap()
     }
 
     fn visible_mut(&mut self) -> &mut ButtonSet {
-        let key = self.visible_key();
+        let key = self.controls_key();
         self.button_set_mut(&key).unwrap()
     }
 
     fn is_set_visible(&self, key: &ButtonSetKey) -> bool {
-        self.visible_key() == *key
+        match key {
+            ButtonSetKey::Strip(generation) => {
+                self.kind == LayerKind::Regions && *generation == self.strip_generation
+            }
+            _ => self.controls_key() == *key,
+        }
     }
 
     fn displays_time(&self) -> bool {
@@ -839,7 +891,10 @@ impl FunctionLayer {
     }
 
     fn any_button_changed(&self) -> bool {
-        self.visible().buttons.iter().any(|b| b.1.changed)
+        let controls_changed = self.visible().buttons.iter().any(|b| b.1.changed);
+        let strip_changed =
+            self.kind == LayerKind::Regions && self.strip.buttons.iter().any(|b| b.1.changed);
+        controls_changed || strip_changed
     }
 
     fn mark_battery_buttons_changed(&mut self) {
@@ -909,6 +964,14 @@ impl FunctionLayer {
         }
     }
 
+    // Geometry of the controls region for a given button set; the region is
+    // right-anchored and never intrudes into the strip.
+    fn controls_geometry(&self, set: &ButtonSet, bar_width: i32) -> RegionGeometry {
+        let strip_geo = strip_region(self.strip.buttons.len());
+        let min_origin = strip_geo.origin + strip_geo.width as f64 + BUTTON_SPACING_PX as f64;
+        controls_region(set.virtual_button_count, bar_width, min_origin)
+    }
+
     fn draw(
         &mut self,
         config: &Config,
@@ -932,18 +995,8 @@ impl FunctionLayer {
             0
         };
         let (pixel_shift_x, pixel_shift_y) = pixel_shift;
-        let visible = self.visible_mut();
-        let button_starts = visible.button_starts();
-        let button_spans = button_spans(LayoutSpec {
-            button_starts: &button_starts,
-            virtual_button_count: visible.virtual_button_count,
-            total_width: width - pixel_shift_width as i32,
-            spacing_px: BUTTON_SPACING_PX,
-            x_offset: pixel_shift_x + (pixel_shift_width / 2) as f64,
-        });
-        let radius = 8.0f64;
-        let bot = (height as f64) * 0.15;
-        let top = (height as f64) * 0.85;
+        let x_offset = pixel_shift_x + (pixel_shift_width / 2) as f64;
+        let effective_width = width - pixel_shift_width as i32;
 
         if complete_redraw {
             c.set_source_rgb(0.0, 0.0, 0.0);
@@ -952,87 +1005,69 @@ impl FunctionLayer {
         c.set_font_face(&config.font_face);
         c.set_font_size(32.0);
 
-        for span in button_spans {
-            let button = &mut visible.buttons[span.index].1;
-
-            if !button.changed && !complete_redraw {
-                continue;
-            };
-
-            let left_edge = span.left_edge;
-            let button_width = span.width;
-
-            let color = if button.is_visually_active() {
-                BUTTON_COLOR_ACTIVE
-            } else if config.show_button_outlines {
-                BUTTON_COLOR_INACTIVE
-            } else {
-                0.0
-            };
-            if !complete_redraw {
-                c.set_source_rgb(0.0, 0.0, 0.0);
-                c.rectangle(
-                    left_edge,
-                    bot - radius,
-                    button_width,
-                    top - bot + radius * 2.0,
+        match self.kind {
+            LayerKind::Classic => {
+                let visible = self.visible_mut();
+                let button_starts = visible.button_starts();
+                let spans = button_spans(LayoutSpec {
+                    button_starts: &button_starts,
+                    virtual_button_count: visible.virtual_button_count,
+                    total_width: effective_width,
+                    spacing_px: BUTTON_SPACING_PX,
+                    x_offset,
+                });
+                draw_button_set(
+                    &c,
+                    visible,
+                    &spans,
+                    config,
+                    height,
+                    complete_redraw,
+                    pixel_shift_y,
+                    &mut modified_regions,
                 );
-                c.fill().unwrap();
             }
-            if !matches!(button.image, ButtonImage::Spacer) {
-                button.set_background_color(&c, color);
-                c.new_sub_path();
-                let left = left_edge + radius;
-                let right = (left_edge + button_width.ceil()) - radius;
-                c.arc(
-                    right,
-                    bot,
-                    radius,
-                    (-90.0f64).to_radians(),
-                    (0.0f64).to_radians(),
+            LayerKind::Regions => {
+                let strip_geo = strip_region(self.strip.buttons.len());
+                let strip_starts = self.strip.button_starts();
+                let strip_spans = button_spans(LayoutSpec {
+                    button_starts: &strip_starts,
+                    virtual_button_count: self.strip.virtual_button_count,
+                    total_width: strip_geo.width,
+                    spacing_px: STRIP_SPACING_PX,
+                    x_offset: strip_geo.origin + x_offset,
+                });
+                draw_button_set(
+                    &c,
+                    &mut self.strip,
+                    &strip_spans,
+                    config,
+                    height,
+                    complete_redraw,
+                    pixel_shift_y,
+                    &mut modified_regions,
                 );
-                c.arc(
-                    right,
-                    top,
-                    radius,
-                    (0.0f64).to_radians(),
-                    (90.0f64).to_radians(),
-                );
-                c.arc(
-                    left,
-                    top,
-                    radius,
-                    (90.0f64).to_radians(),
-                    (180.0f64).to_radians(),
-                );
-                c.arc(
-                    left,
-                    bot,
-                    radius,
-                    (180.0f64).to_radians(),
-                    (270.0f64).to_radians(),
-                );
-                c.close_path();
-                c.fill().unwrap();
-            }
-            c.set_source_rgb(1.0, 1.0, 1.0);
-            button.render(
-                &c,
-                height,
-                left_edge,
-                button_width.ceil() as u64,
-                pixel_shift_y,
-            );
 
-            button.changed = false;
-
-            if !complete_redraw {
-                modified_regions.push(ClipRect::new(
-                    height as u16 - top as u16 - radius as u16,
-                    left_edge as u16,
-                    height as u16 - bot as u16 + radius as u16,
-                    left_edge as u16 + button_width as u16,
-                ));
+                let controls_geo = self.controls_geometry(self.visible(), effective_width);
+                let controls = self.visible_mut();
+                let controls_starts = controls.button_starts();
+                let controls_spans = button_spans(LayoutSpec {
+                    button_starts: &controls_starts,
+                    virtual_button_count: controls.virtual_button_count,
+                    total_width: controls_geo.width,
+                    spacing_px: BUTTON_SPACING_PX,
+                    x_offset: controls_geo.origin + x_offset,
+                });
+                draw_button_set(
+                    &c,
+                    controls,
+                    &controls_spans,
+                    config,
+                    height,
+                    complete_redraw,
+                    pixel_shift_y,
+                    &mut modified_regions,
+                );
             }
         }
 
@@ -1053,16 +1088,30 @@ impl FunctionLayer {
         }
         let button_set = self.button_set(key)?;
         let button_starts = button_set.button_starts();
+        // Regions hit-test in region-local coordinates; a tap left of the
+        // region maps to a negative x_rel, which hit_index rejects on the
+        // span bounds check.
+        let (total_width, spacing_px, x_rel) = match (self.kind, key) {
+            (LayerKind::Regions, ButtonSetKey::Strip(_)) => {
+                let geo = strip_region(button_set.buttons.len());
+                (geo.width, STRIP_SPACING_PX, x - geo.origin)
+            }
+            (LayerKind::Regions, _) => {
+                let geo = self.controls_geometry(button_set, width as i32);
+                (geo.width, BUTTON_SPACING_PX, x - geo.origin)
+            }
+            (LayerKind::Classic, _) => (width as i32, BUTTON_SPACING_PX, x),
+        };
         hit_index(
             LayoutSpec {
                 button_starts: &button_starts,
                 virtual_button_count: button_set.virtual_button_count,
-                total_width: width as i32,
-                spacing_px: BUTTON_SPACING_PX,
+                total_width,
+                spacing_px,
                 x_offset: 0.0,
             },
             height,
-            x,
+            x_rel,
             y,
             i,
         )
@@ -1070,13 +1119,134 @@ impl FunctionLayer {
 
     #[cfg(test)]
     fn hit(&self, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
-        self.hit_in_set(width, height, x, y, &self.visible_key(), i)
+        self.hit_in_set(width, height, x, y, &self.controls_key(), i)
     }
 
-    fn hit_target(&self, width: u16, height: u16, x: f64, y: f64) -> Option<(ButtonSetKey, usize)> {
-        let key = self.visible_key();
-        self.hit_in_set(width, height, x, y, &key, None)
-            .map(|index| (key, index))
+    fn hit_target(&self, width: u16, height: u16, x: f64, y: f64) -> HitOutcome {
+        if self.kind == LayerKind::Regions {
+            let strip_key = ButtonSetKey::Strip(self.strip_generation);
+            if let Some(index) = self.hit_in_set(width, height, x, y, &strip_key, None) {
+                return HitOutcome::Button(strip_key, index);
+            }
+        }
+        let key = self.controls_key();
+        if let Some(index) = self.hit_in_set(width, height, x, y, &key, None) {
+            return HitOutcome::Button(key, index);
+        }
+        if self.kind == LayerKind::Regions && !self.overlay_stack.is_empty() {
+            HitOutcome::OutsideControls
+        } else {
+            HitOutcome::Miss
+        }
+    }
+}
+
+// A touch-down classified against the visible regions. OutsideControls only
+// occurs in Regions mode with an overlay open; the upcoming tap-outside close
+// path consumes it.
+enum HitOutcome {
+    Button(ButtonSetKey, usize),
+    OutsideControls,
+    Miss,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_button_set(
+    c: &Context,
+    set: &mut ButtonSet,
+    spans: &[ButtonSpan],
+    config: &Config,
+    height: i32,
+    complete_redraw: bool,
+    pixel_shift_y: f64,
+    modified_regions: &mut Vec<ClipRect>,
+) {
+    let radius = 8.0f64;
+    let bot = (height as f64) * 0.15;
+    let top = (height as f64) * 0.85;
+
+    for span in spans {
+        let button = &mut set.buttons[span.index].1;
+
+        if !button.changed && !complete_redraw {
+            continue;
+        };
+
+        let left_edge = span.left_edge;
+        let button_width = span.width;
+
+        let color = if button.is_visually_active() {
+            BUTTON_COLOR_ACTIVE
+        } else if config.show_button_outlines {
+            BUTTON_COLOR_INACTIVE
+        } else {
+            0.0
+        };
+        if !complete_redraw {
+            c.set_source_rgb(0.0, 0.0, 0.0);
+            c.rectangle(
+                left_edge,
+                bot - radius,
+                button_width,
+                top - bot + radius * 2.0,
+            );
+            c.fill().unwrap();
+        }
+        if !matches!(button.image, ButtonImage::Spacer) {
+            button.set_background_color(c, color);
+            c.new_sub_path();
+            let left = left_edge + radius;
+            let right = (left_edge + button_width.ceil()) - radius;
+            c.arc(
+                right,
+                bot,
+                radius,
+                (-90.0f64).to_radians(),
+                (0.0f64).to_radians(),
+            );
+            c.arc(
+                right,
+                top,
+                radius,
+                (0.0f64).to_radians(),
+                (90.0f64).to_radians(),
+            );
+            c.arc(
+                left,
+                top,
+                radius,
+                (90.0f64).to_radians(),
+                (180.0f64).to_radians(),
+            );
+            c.arc(
+                left,
+                bot,
+                radius,
+                (180.0f64).to_radians(),
+                (270.0f64).to_radians(),
+            );
+            c.close_path();
+            c.fill().unwrap();
+        }
+        c.set_source_rgb(1.0, 1.0, 1.0);
+        button.render(
+            c,
+            height,
+            left_edge,
+            button_width.ceil() as u64,
+            pixel_shift_y,
+        );
+
+        button.changed = false;
+
+        if !complete_redraw {
+            modified_regions.push(ClipRect::new(
+                height as u16 - top as u16 - radius as u16,
+                left_edge as u16,
+                height as u16 - bot as u16 + radius as u16,
+                left_edge as u16 + button_width as u16,
+            ));
+        }
     }
 }
 
@@ -1113,6 +1283,7 @@ mod function_layer_tests {
                 text_button("base", ButtonAction::None),
             ],
             groups,
+            None,
         );
 
         assert_eq!(layer.hit(100, 20, 75.0, 10.0, None), Some(1));
@@ -1133,6 +1304,7 @@ mod function_layer_tests {
                 text_button("base", ButtonAction::None),
             ],
             groups,
+            None,
         );
 
         assert!(layer.open_overlay("volume"));
@@ -1146,6 +1318,7 @@ mod function_layer_tests {
         let mut layer = FunctionLayer::with_config(
             vec![text_button("key", ButtonAction::Keys(vec![Key::F1]))],
             HashMap::new(),
+            None,
         );
 
         assert!(!layer.activate_button_action(ButtonAction::Keys(vec![Key::F1])));
@@ -1171,6 +1344,7 @@ mod function_layer_tests {
                 ButtonAction::OpenOverlay("sound".to_string()),
             )],
             groups,
+            None,
         )
     }
 
@@ -1182,7 +1356,7 @@ mod function_layer_tests {
         assert!(layer.open_overlay("volume"));
 
         assert_eq!(
-            layer.visible_key(),
+            layer.controls_key(),
             ButtonSetKey::Overlay("volume".to_string())
         );
     }
@@ -1195,7 +1369,7 @@ mod function_layer_tests {
 
         assert!(layer.close_all_overlays());
 
-        assert_eq!(layer.visible_key(), ButtonSetKey::Base);
+        assert_eq!(layer.controls_key(), ButtonSetKey::Base);
         assert!(!layer.close_all_overlays());
     }
 
@@ -1208,7 +1382,7 @@ mod function_layer_tests {
         assert!(layer.activate_button_action(ButtonAction::CloseOverlay));
 
         assert_eq!(
-            layer.visible_key(),
+            layer.controls_key(),
             ButtonSetKey::Overlay("sound".to_string())
         );
     }
@@ -1240,7 +1414,125 @@ mod function_layer_tests {
 
         assert!(!layer.open_overlay("does-not-exist"));
 
-        assert_eq!(layer.visible_key(), ButtonSetKey::Base);
+        assert_eq!(layer.controls_key(), ButtonSetKey::Base);
+    }
+
+    const BAR_WIDTH: u16 = 2008;
+    const BAR_HEIGHT: u16 = 60;
+
+    fn ws_cfg(fallback_buttons: usize) -> WorkspacesCfg {
+        WorkspacesCfg {
+            max_buttons: 9,
+            fallback_buttons,
+            actions: vec![],
+        }
+    }
+
+    fn regions_layer(fallback_buttons: usize) -> FunctionLayer {
+        let mut groups = HashMap::new();
+        groups.insert(
+            "canary".to_string(),
+            vec![text_button("x", ButtonAction::None)],
+        );
+        FunctionLayer::with_config(
+            vec![
+                text_button("open", ButtonAction::OpenOverlay("canary".to_string())),
+                text_button("play", ButtonAction::Keys(vec![Key::F2])),
+            ],
+            groups,
+            Some(&ws_cfg(fallback_buttons)),
+        )
+    }
+
+    #[test]
+    fn fallback_strip_has_single_unhighlighted_workspace_one() {
+        let layer = regions_layer(1);
+
+        assert_eq!(layer.strip.buttons.len(), 1);
+        let button = &layer.strip.buttons[0].1;
+        assert!(matches!(&button.image, ButtonImage::Text(t) if t == "1"));
+        assert_eq!(
+            button.action,
+            ButtonAction::Keys(vec![Key::LeftAlt, Key::Num1])
+        );
+        assert!(!button.highlighted);
+    }
+
+    #[test]
+    fn strip_hits_use_region_local_coordinates() {
+        let layer = regions_layer(4);
+
+        // Strip: origin 12, four 60px buttons with 10px gaps.
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 42.0, 30.0),
+            HitOutcome::Button(ButtonSetKey::Strip(0), 0)
+        ));
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 112.0, 30.0),
+            HitOutcome::Button(ButtonSetKey::Strip(0), 1)
+        ));
+        // Controls: two launchers right-anchored at 2008 - 12 - 236 = 1760.
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 1765.0, 30.0),
+            HitOutcome::Button(ButtonSetKey::Base, 0)
+        ));
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 1990.0, 30.0),
+            HitOutcome::Button(ButtonSetKey::Base, 1)
+        ));
+        // The free middle is nothing while no overlay is open.
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 1000.0, 30.0),
+            HitOutcome::Miss
+        ));
+    }
+
+    #[test]
+    fn outside_tap_with_overlay_open_is_outside_controls() {
+        let mut layer = regions_layer(4);
+        assert!(layer.open_overlay("canary"));
+
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 1000.0, 30.0),
+            HitOutcome::OutsideControls
+        ));
+        // Strip buttons stay live targets while the overlay is open.
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 42.0, 30.0),
+            HitOutcome::Button(ButtonSetKey::Strip(0), 0)
+        ));
+    }
+
+    #[test]
+    fn stale_strip_generation_is_not_visible() {
+        let mut layer = regions_layer(4);
+        let stale = ButtonSetKey::Strip(layer.strip_generation);
+        layer.strip_generation += 1;
+
+        assert!(!layer.is_set_visible(&stale));
+        assert!(layer.button_set(&stale).is_none());
+        assert_eq!(
+            layer.hit_in_set(BAR_WIDTH, BAR_HEIGHT, 42.0, 30.0, &stale, Some(0)),
+            None
+        );
+        assert!(layer.is_set_visible(&ButtonSetKey::Strip(layer.strip_generation)));
+    }
+
+    #[test]
+    fn classic_layer_has_no_strip_targets() {
+        let layer = FunctionLayer::with_config(
+            vec![text_button("a", ButtonAction::None)],
+            HashMap::new(),
+            None,
+        );
+
+        assert_eq!(layer.kind, LayerKind::Classic);
+        assert!(layer.button_set(&ButtonSetKey::Strip(0)).is_none());
+        // Full-bar hit routing still works.
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 1000.0, 30.0),
+            HitOutcome::Button(ButtonSetKey::Base, 0)
+        ));
     }
 
     #[test]
@@ -1256,8 +1548,9 @@ mod function_layer_tests {
                 text_button("base", ButtonAction::Keys(vec![Key::F1])),
             ],
             groups,
+            None,
         );
-        let base = layer.visible_key();
+        let base = layer.controls_key();
 
         assert_eq!(
             layer.hit_in_set(100, 20, 75.0, 10.0, &base, Some(1)),
@@ -1530,17 +1823,20 @@ fn real_main(drm: &mut DrmBackend) {
                         TouchEvent::Down(dn) => {
                             let x = dn.x_transformed(width as u32);
                             let y = dn.y_transformed(height as u32);
-                            if let Some((button_set, btn)) =
-                                layers[active_layer].hit_target(width, height, x, y)
-                            {
-                                touches.insert(dn.seat_slot(), (active_layer, button_set, btn));
-                                let (layer, button_set, btn) =
-                                    touches.get(&dn.seat_slot()).unwrap().clone();
-                                if let Some(button) =
-                                    layers[layer].button_mut_in_set(&button_set, btn)
-                                {
-                                    button.set_active(&mut uinput, true);
+                            match layers[active_layer].hit_target(width, height, x, y) {
+                                HitOutcome::Button(button_set, btn) => {
+                                    touches.insert(dn.seat_slot(), (active_layer, button_set, btn));
+                                    let (layer, button_set, btn) =
+                                        touches.get(&dn.seat_slot()).unwrap().clone();
+                                    if let Some(button) =
+                                        layers[layer].button_mut_in_set(&button_set, btn)
+                                    {
+                                        button.set_active(&mut uinput, true);
+                                    }
                                 }
+                                // Tap-outside close semantics land with the
+                                // auto-timeout work.
+                                HitOutcome::OutsideControls | HitOutcome::Miss => {}
                             }
                         }
                         TouchEvent::Motion(mtn) => {

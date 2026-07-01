@@ -38,6 +38,67 @@ struct ConfigProxy {
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
     control_groups: Option<HashMap<String, Vec<ButtonConfig>>>,
+    workspaces: Option<WorkspacesProxy>,
+}
+
+// Presence of a [Workspaces] table switches the media layer into Regions
+// mode: a compact workspace strip pinned on the left with the configured
+// MediaLayerKeys right-anchored as the controls region.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WorkspacesProxy {
+    max_buttons: Option<usize>,
+    fallback_buttons: Option<usize>,
+    actions: Option<Vec<Vec<Key>>>,
+}
+
+pub struct WorkspacesCfg {
+    // Consumed by the upcoming live-strip path, which truncates pushed
+    // workspace state to this many buttons.
+    #[allow(dead_code)]
+    pub max_buttons: usize,
+    pub fallback_buttons: usize,
+    pub actions: Vec<Vec<Key>>,
+}
+
+pub const WORKSPACE_BUTTON_HARD_CAP: usize = 9;
+
+fn default_workspace_action(idx: usize) -> Vec<Key> {
+    let num = match idx {
+        1 => Key::Num1,
+        2 => Key::Num2,
+        3 => Key::Num3,
+        4 => Key::Num4,
+        5 => Key::Num5,
+        6 => Key::Num6,
+        7 => Key::Num7,
+        8 => Key::Num8,
+        _ => Key::Num9,
+    };
+    vec![Key::LeftAlt, num]
+}
+
+impl WorkspacesCfg {
+    fn resolve(proxy: WorkspacesProxy) -> WorkspacesCfg {
+        let max_buttons = proxy
+            .max_buttons
+            .unwrap_or(WORKSPACE_BUTTON_HARD_CAP)
+            .clamp(1, WORKSPACE_BUTTON_HARD_CAP);
+        let fallback_buttons = proxy.fallback_buttons.unwrap_or(1).clamp(1, max_buttons);
+        WorkspacesCfg {
+            max_buttons,
+            fallback_buttons,
+            actions: proxy.actions.unwrap_or_default(),
+        }
+    }
+
+    /// Keys emitted by the workspace button with 1-based index `idx`.
+    pub fn action_for(&self, idx: usize) -> Vec<Key> {
+        self.actions
+            .get(idx.saturating_sub(1))
+            .cloned()
+            .unwrap_or_else(|| default_workspace_action(idx))
+    }
 }
 
 fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
@@ -118,6 +179,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         base.media_layer_keys = user.media_layer_keys.or(base.media_layer_keys);
         base.primary_layer_keys = user.primary_layer_keys.or(base.primary_layer_keys);
         base.control_groups = user.control_groups.or(base.control_groups);
+        base.workspaces = user.workspaces.or(base.workspaces);
         base.active_brightness = user.active_brightness.or(base.active_brightness);
         base.double_press_switch_layers = user
             .double_press_switch_layers
@@ -138,8 +200,13 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
             );
         }
     }
-    let media_layer = FunctionLayer::with_config(media_layer_keys, control_groups.clone());
-    let fkey_layer = FunctionLayer::with_config(primary_layer_keys, control_groups);
+    let workspaces = base.workspaces.map(WorkspacesCfg::resolve);
+    let media_layer = FunctionLayer::with_config(
+        media_layer_keys,
+        control_groups.clone(),
+        workspaces.as_ref(),
+    );
+    let fkey_layer = FunctionLayer::with_config(primary_layer_keys, control_groups, None);
     let layers = if base.media_layer_default.unwrap() {
         [media_layer, fkey_layer]
     } else {
