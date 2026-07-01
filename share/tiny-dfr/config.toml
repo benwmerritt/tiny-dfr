@@ -49,6 +49,8 @@ DoublePressSwitchLayers = 0
 # to a number greater than 1 (which means the button will take up
 # that many button spaces).
 PrimaryLayerKeys = [
+    # Id is optional and gives the button a stable identifier for external
+    # state updates, such as workspace highlighting through a control socket.
     # Action defines the key code to send when the button is pressed
     # You can specify either a single key, or a key combo by
     # setting this field to an array.

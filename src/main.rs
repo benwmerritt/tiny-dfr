@@ -100,6 +100,10 @@ enum ButtonImage {
 }
 
 struct Button {
+    // Used by the upcoming control socket path to address buttons from
+    // external state without coupling tiny-dfr to Niri-specific concepts.
+    #[allow(dead_code)]
+    id: Option<String>,
     image: ButtonImage,
     changed: bool,
     pressed: bool,
@@ -256,7 +260,8 @@ fn get_battery_state(battery: &str) -> (u32, BatteryState) {
 
 impl Button {
     fn with_config(cfg: ButtonConfig) -> Button {
-        if let Some(text) = cfg.text {
+        let id = cfg.id;
+        let mut button = if let Some(text) = cfg.text {
             Button::new_text(text, cfg.action)
         } else if let Some(icon) = cfg.icon {
             Button::new_icon(
@@ -276,10 +281,13 @@ impl Button {
             }
         } else {
             Button::new_spacer()
-        }
+        };
+        button.id = id;
+        button
     }
     fn new_spacer() -> Button {
         Button {
+            id: None,
             action: vec![],
             pressed: false,
             highlighted: false,
@@ -291,6 +299,7 @@ impl Button {
     }
     fn new_text(text: String, action: Vec<Key>) -> Button {
         Button {
+            id: None,
             action,
             pressed: false,
             highlighted: false,
@@ -310,6 +319,7 @@ impl Button {
         let image =
             try_load_image(path, theme, icon_width, icon_height).expect("failed to load icon");
         Button {
+            id: None,
             action,
             image,
             icon_width: icon_width as f64,
@@ -366,6 +376,7 @@ impl Button {
             _ => panic!("invalid battery mode, accepted modes: icon, percentage, both"),
         };
         Button {
+            id: None,
             action,
             pressed: false,
             highlighted: false,
@@ -402,6 +413,7 @@ impl Button {
             .and_then(|l| Locale::try_from(l).ok())
             .unwrap_or(Locale::POSIX);
         Button {
+            id: None,
             action,
             pressed: false,
             highlighted: false,
@@ -610,6 +622,25 @@ mod button_tests {
 
         assert!(button.changed);
         assert!(!button.pressed);
+    }
+
+    #[test]
+    fn button_config_can_carry_a_stable_id() {
+        let button = Button::with_config(ButtonConfig {
+            id: Some("workspace-1".to_string()),
+            icon: None,
+            text: Some("1".to_string()),
+            theme: None,
+            time: None,
+            battery: None,
+            locale: None,
+            action: vec![],
+            stretch: None,
+            icon_width: None,
+            icon_height: None,
+        });
+
+        assert_eq!(button.id.as_deref(), Some("workspace-1"));
     }
 }
 

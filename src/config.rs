@@ -69,6 +69,7 @@ where
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ButtonConfig {
+    pub id: Option<String>,
     #[serde(alias = "Svg")]
     pub icon: Option<String>,
     pub text: Option<String>,
@@ -125,6 +126,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
             layer.insert(
                 0,
                 ButtonConfig {
+                    id: None,
                     icon: None,
                     text: Some("esc".into()),
                     theme: None,
