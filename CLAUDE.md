@@ -16,6 +16,20 @@ Build a safer local tiny-dfr fork for Ben's Arch/T2 MacBook Touch Bar that can s
 - active Niri workspace highlighting through a narrow state interface;
 - a rollback path to stock tiny-dfr if the Touch Bar glitches.
 
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked as local markdown under `.scratch/<feature-slug>/`; external PRs are not a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default five triage roles: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repo: use root `CONTEXT.md` for vocabulary and root `docs/adr/` for architectural decisions when present. See `docs/agents/domain.md`.
+
 ## Safety rules
 
 - Do not live-install, replace, restart, or stop the running Touch Bar service unless Ben explicitly approves that action in the current chat.
