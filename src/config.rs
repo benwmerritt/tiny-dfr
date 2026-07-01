@@ -12,7 +12,7 @@ use serde::{
     de::{self, Visitor},
     Deserialize, Deserializer,
 };
-use std::{fmt, fs::read_to_string, os::fd::AsFd};
+use std::{collections::HashMap, fmt, fs::read_to_string, os::fd::AsFd};
 
 const USER_CFG_PATH: &str = "/etc/tiny-dfr/config.toml";
 
@@ -37,6 +37,7 @@ struct ConfigProxy {
     double_press_switch_layers: Option<u32>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
+    control_groups: Option<HashMap<String, Vec<ButtonConfig>>>,
 }
 
 fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
@@ -66,7 +67,7 @@ where
     deserializer.deserialize_any(ArrayOrSingle)
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ButtonConfig {
     pub id: Option<String>,
@@ -79,6 +80,8 @@ pub struct ButtonConfig {
     pub locale: Option<String>,
     #[serde(deserialize_with = "array_or_single", default)]
     pub action: Vec<Key>,
+    pub open_overlay: Option<String>,
+    pub close_overlay: Option<bool>,
     pub stretch: Option<usize>,
     pub icon_width: Option<i32>,
     pub icon_height: Option<i32>,
@@ -114,11 +117,13 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         base.adaptive_brightness = user.adaptive_brightness.or(base.adaptive_brightness);
         base.media_layer_keys = user.media_layer_keys.or(base.media_layer_keys);
         base.primary_layer_keys = user.primary_layer_keys.or(base.primary_layer_keys);
+        base.control_groups = user.control_groups.or(base.control_groups);
         base.active_brightness = user.active_brightness.or(base.active_brightness);
         base.double_press_switch_layers = user
             .double_press_switch_layers
             .or(base.double_press_switch_layers);
     };
+    let control_groups = base.control_groups.unwrap_or_default();
     let mut media_layer_keys = base.media_layer_keys.unwrap();
     let mut primary_layer_keys = base.primary_layer_keys.unwrap();
     if width >= 2170 {
@@ -131,6 +136,8 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
                     text: Some("esc".into()),
                     theme: None,
                     action: vec![Key::Esc],
+                    open_overlay: None,
+                    close_overlay: None,
                     stretch: None,
                     time: None,
                     locale: None,
@@ -141,8 +148,8 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
             );
         }
     }
-    let media_layer = FunctionLayer::with_config(media_layer_keys);
-    let fkey_layer = FunctionLayer::with_config(primary_layer_keys);
+    let media_layer = FunctionLayer::with_config(media_layer_keys, control_groups.clone());
+    let fkey_layer = FunctionLayer::with_config(primary_layer_keys, control_groups);
     let layers = if base.media_layer_default.unwrap() {
         [media_layer, fkey_layer]
     } else {

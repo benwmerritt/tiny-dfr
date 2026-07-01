@@ -168,3 +168,20 @@ MediaLayerKeys = [
     # { Icon = "audio-volume-low",     Theme = "breeze-dark", Action = "VolumeDown"     },
     # { Icon = "audio-volume-high",    Theme = "breeze-dark", Action = "VolumeUp"       }
 ]
+
+# ControlGroups define named overlay button sets. A normal layer button can
+# open one with OpenOverlay = "name"; a button inside the overlay can close it
+# with CloseOverlay = true. OpenOverlay and CloseOverlay buttons do not emit
+# key actions themselves.
+#
+# Example:
+# [ControlGroups]
+# volume = [
+#     { Icon = "volume_off",  Action = "Mute"       },
+#     { Icon = "volume_down", Action = "VolumeDown" },
+#     { Icon = "volume_up",   Action = "VolumeUp"   },
+#     { Text = "×", CloseOverlay = true },
+# ]
+#
+# Then add a launcher to PrimaryLayerKeys or MediaLayerKeys:
+# { Icon = "volume_up", OpenOverlay = "volume" }

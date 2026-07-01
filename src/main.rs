@@ -99,6 +99,35 @@ enum ButtonImage {
     Spacer,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ButtonAction {
+    Keys(Vec<Key>),
+    OpenOverlay(String),
+    CloseOverlay,
+    None,
+}
+
+impl ButtonAction {
+    fn from_config(cfg: &ButtonConfig) -> ButtonAction {
+        if let Some(name) = &cfg.open_overlay {
+            ButtonAction::OpenOverlay(name.clone())
+        } else if cfg.close_overlay.unwrap_or(false) {
+            ButtonAction::CloseOverlay
+        } else if cfg.action.is_empty() {
+            ButtonAction::None
+        } else {
+            ButtonAction::Keys(cfg.action.clone())
+        }
+    }
+
+    fn keys(&self) -> &[Key] {
+        match self {
+            ButtonAction::Keys(keys) => keys,
+            ButtonAction::OpenOverlay(_) | ButtonAction::CloseOverlay | ButtonAction::None => &[],
+        }
+    }
+}
+
 struct Button {
     // Used by the upcoming control socket path to address buttons from
     // external state without coupling tiny-dfr to Niri-specific concepts.
@@ -108,7 +137,7 @@ struct Button {
     changed: bool,
     pressed: bool,
     highlighted: bool,
-    action: Vec<Key>,
+    action: ButtonAction,
     icon_width: f64,
     icon_height: f64,
 }
@@ -260,24 +289,25 @@ fn get_battery_state(battery: &str) -> (u32, BatteryState) {
 
 impl Button {
     fn with_config(cfg: ButtonConfig) -> Button {
-        let id = cfg.id;
+        let id = cfg.id.clone();
+        let action = ButtonAction::from_config(&cfg);
         let mut button = if let Some(text) = cfg.text {
-            Button::new_text(text, cfg.action)
+            Button::new_text(text, action)
         } else if let Some(icon) = cfg.icon {
             Button::new_icon(
                 &icon,
                 cfg.theme,
-                cfg.action,
+                action,
                 cfg.icon_width.unwrap_or(DEFAULT_ICON_SIZE),
                 cfg.icon_height.unwrap_or(DEFAULT_ICON_SIZE),
             )
         } else if let Some(time) = cfg.time {
-            Button::new_time(cfg.action, &time, cfg.locale.as_deref())
+            Button::new_time(action, &time, cfg.locale.as_deref())
         } else if let Some(battery_mode) = cfg.battery {
             if let Some(battery) = find_battery_device() {
-                Button::new_battery(cfg.action, battery, battery_mode, cfg.theme)
+                Button::new_battery(action, battery, battery_mode, cfg.theme)
             } else {
-                Button::new_text("Battery N/A".to_string(), cfg.action)
+                Button::new_text("Battery N/A".to_string(), action)
             }
         } else {
             Button::new_spacer()
@@ -288,7 +318,7 @@ impl Button {
     fn new_spacer() -> Button {
         Button {
             id: None,
-            action: vec![],
+            action: ButtonAction::None,
             pressed: false,
             highlighted: false,
             changed: false,
@@ -297,7 +327,7 @@ impl Button {
             icon_height: 0.0,
         }
     }
-    fn new_text(text: String, action: Vec<Key>) -> Button {
+    fn new_text(text: String, action: ButtonAction) -> Button {
         Button {
             id: None,
             action,
@@ -312,7 +342,7 @@ impl Button {
     fn new_icon(
         path: impl AsRef<str>,
         theme: Option<impl AsRef<str>>,
-        action: Vec<Key>,
+        action: ButtonAction,
         icon_width: i32,
         icon_height: i32,
     ) -> Button {
@@ -338,7 +368,7 @@ impl Button {
         panic!("failed to load icon");
     }
     fn new_battery(
-        action: Vec<Key>,
+        action: ButtonAction,
         battery: String,
         battery_mode: String,
         theme: Option<impl AsRef<str>>,
@@ -395,7 +425,7 @@ impl Button {
         }
     }
 
-    fn new_time(action: Vec<Key>, format: &str, locale_str: Option<&str>) -> Button {
+    fn new_time(action: ButtonAction, format: &str, locale_str: Option<&str>) -> Button {
         let format_str = if format == "24hr" {
             "%H:%M    %a %-e %b"
         } else if format == "12hr" {
@@ -567,7 +597,7 @@ impl Button {
             self.pressed = active;
             self.changed = true;
 
-            toggle_keys(uinput, &self.action, active as i32);
+            toggle_keys(uinput, self.action.keys(), active as i32);
         }
     }
     fn set_background_color(&self, c: &Context, color: f64) {
@@ -588,16 +618,34 @@ impl Button {
 mod button_tests {
     use super::*;
 
+    fn text_button_config(text: &str) -> ButtonConfig {
+        ButtonConfig {
+            id: None,
+            icon: None,
+            text: Some(text.to_string()),
+            theme: None,
+            time: None,
+            battery: None,
+            locale: None,
+            action: vec![],
+            open_overlay: None,
+            close_overlay: None,
+            stretch: None,
+            icon_width: None,
+            icon_height: None,
+        }
+    }
+
     #[test]
     fn new_button_is_not_visually_active() {
-        let button = Button::new_text("workspace".to_string(), vec![]);
+        let button = Button::new_text("workspace".to_string(), ButtonAction::None);
 
         assert!(!button.is_visually_active());
     }
 
     #[test]
     fn pressed_button_is_visually_active() {
-        let mut button = Button::new_text("workspace".to_string(), vec![]);
+        let mut button = Button::new_text("workspace".to_string(), ButtonAction::None);
 
         button.pressed = true;
 
@@ -606,7 +654,7 @@ mod button_tests {
 
     #[test]
     fn highlighted_button_is_visually_active_without_pressing_keys() {
-        let mut button = Button::new_text("workspace".to_string(), vec![]);
+        let mut button = Button::new_text("workspace".to_string(), ButtonAction::None);
 
         button.set_highlighted(true);
 
@@ -616,7 +664,7 @@ mod button_tests {
 
     #[test]
     fn setting_highlight_marks_button_changed_without_pressing_it() {
-        let mut button = Button::new_text("workspace".to_string(), vec![]);
+        let mut button = Button::new_text("workspace".to_string(), ButtonAction::None);
 
         button.set_highlighted(true);
 
@@ -628,24 +676,61 @@ mod button_tests {
     fn button_config_can_carry_a_stable_id() {
         let button = Button::with_config(ButtonConfig {
             id: Some("workspace-1".to_string()),
-            icon: None,
-            text: Some("1".to_string()),
-            theme: None,
-            time: None,
-            battery: None,
-            locale: None,
-            action: vec![],
-            stretch: None,
-            icon_width: None,
-            icon_height: None,
+            ..text_button_config("1")
         });
 
         assert_eq!(button.id.as_deref(), Some("workspace-1"));
     }
+
+    #[test]
+    fn button_config_classifies_key_action() {
+        let cfg: ButtonConfig = toml::from_str(
+            r#"Text = "K"
+Action = ["LeftCtrl", "F1"]"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ButtonAction::from_config(&cfg),
+            ButtonAction::Keys(vec![Key::LeftCtrl, Key::F1])
+        );
+    }
+
+    #[test]
+    fn button_config_classifies_open_overlay_without_keys() {
+        let cfg: ButtonConfig = toml::from_str(
+            r#"Text = "V"
+Action = "VolumeUp"
+OpenOverlay = "volume""#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ButtonAction::from_config(&cfg),
+            ButtonAction::OpenOverlay("volume".to_string())
+        );
+    }
+
+    #[test]
+    fn button_config_classifies_close_overlay_without_keys() {
+        let cfg: ButtonConfig = toml::from_str(
+            r#"Text = "×"
+CloseOverlay = true"#,
+        )
+        .unwrap();
+
+        assert_eq!(ButtonAction::from_config(&cfg), ButtonAction::CloseOverlay);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ButtonSetKey {
+    Base,
+    Overlay(String),
 }
 
 #[derive(Default)]
-pub struct FunctionLayer {
+struct ButtonSet {
     displays_time: bool,
     displays_battery: bool,
     buttons: Vec<(usize, Button)>,
@@ -653,8 +738,8 @@ pub struct FunctionLayer {
     faster_refresh: bool,
 }
 
-impl FunctionLayer {
-    fn with_config(cfg: Vec<ButtonConfig>) -> FunctionLayer {
+impl ButtonSet {
+    fn with_config(cfg: Vec<ButtonConfig>) -> ButtonSet {
         if cfg.is_empty() {
             panic!("Invalid configuration, layer has 0 buttons");
         }
@@ -676,7 +761,7 @@ impl FunctionLayer {
             })
             .collect::<Vec<_>>();
         let faster_refresh = buttons.iter().any(|(_, b)| b.needs_faster_refresh());
-        FunctionLayer {
+        ButtonSet {
             displays_time,
             displays_battery,
             buttons,
@@ -684,6 +769,140 @@ impl FunctionLayer {
             faster_refresh,
         }
     }
+
+    fn button_starts(&self) -> Vec<usize> {
+        self.buttons.iter().map(|(start, _)| *start).collect()
+    }
+}
+
+#[derive(Default)]
+pub struct FunctionLayer {
+    base: ButtonSet,
+    overlays: HashMap<String, ButtonSet>,
+    open_overlay: Option<String>,
+}
+
+impl FunctionLayer {
+    fn with_config(
+        cfg: Vec<ButtonConfig>,
+        control_groups: HashMap<String, Vec<ButtonConfig>>,
+    ) -> FunctionLayer {
+        let base = ButtonSet::with_config(cfg);
+        let overlays = control_groups
+            .into_iter()
+            .map(|(name, cfg)| (name, ButtonSet::with_config(cfg)))
+            .collect();
+        FunctionLayer {
+            base,
+            overlays,
+            open_overlay: None,
+        }
+    }
+
+    fn visible_key(&self) -> ButtonSetKey {
+        self.open_overlay
+            .as_ref()
+            .filter(|name| self.overlays.contains_key(*name))
+            .map(|name| ButtonSetKey::Overlay(name.clone()))
+            .unwrap_or(ButtonSetKey::Base)
+    }
+
+    fn button_set(&self, key: &ButtonSetKey) -> Option<&ButtonSet> {
+        match key {
+            ButtonSetKey::Base => Some(&self.base),
+            ButtonSetKey::Overlay(name) => self.overlays.get(name),
+        }
+    }
+
+    fn button_set_mut(&mut self, key: &ButtonSetKey) -> Option<&mut ButtonSet> {
+        match key {
+            ButtonSetKey::Base => Some(&mut self.base),
+            ButtonSetKey::Overlay(name) => self.overlays.get_mut(name),
+        }
+    }
+
+    fn visible(&self) -> &ButtonSet {
+        self.button_set(&self.visible_key()).unwrap()
+    }
+
+    fn visible_mut(&mut self) -> &mut ButtonSet {
+        let key = self.visible_key();
+        self.button_set_mut(&key).unwrap()
+    }
+
+    fn is_set_visible(&self, key: &ButtonSetKey) -> bool {
+        self.visible_key() == *key
+    }
+
+    fn displays_time(&self) -> bool {
+        self.visible().displays_time
+    }
+
+    fn displays_battery(&self) -> bool {
+        self.visible().displays_battery
+    }
+
+    fn faster_refresh(&self) -> bool {
+        self.visible().faster_refresh
+    }
+
+    fn any_button_changed(&self) -> bool {
+        self.visible().buttons.iter().any(|b| b.1.changed)
+    }
+
+    fn mark_battery_buttons_changed(&mut self) {
+        for button in &mut self.visible_mut().buttons {
+            if let ButtonImage::Battery(_, _, _) = button.1.image {
+                button.1.changed = true;
+            }
+        }
+    }
+
+    fn button_mut_in_set(&mut self, key: &ButtonSetKey, index: usize) -> Option<&mut Button> {
+        self.button_set_mut(key)
+            .and_then(|set| set.buttons.get_mut(index))
+            .map(|(_, button)| button)
+    }
+
+    fn button_action_in_set(&self, key: &ButtonSetKey, index: usize) -> Option<ButtonAction> {
+        self.button_set(key)
+            .and_then(|set| set.buttons.get(index))
+            .map(|(_, button)| button.action.clone())
+    }
+
+    fn open_overlay(&mut self, name: &str) -> bool {
+        if self.overlays.contains_key(name) {
+            self.open_overlay = Some(name.to_string());
+            for (_, button) in &mut self.visible_mut().buttons {
+                button.changed = true;
+                button.pressed = false;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn close_overlay(&mut self) -> bool {
+        if self.open_overlay.take().is_some() {
+            for (_, button) in &mut self.base.buttons {
+                button.changed = true;
+                button.pressed = false;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn activate_button_action(&mut self, action: ButtonAction) -> bool {
+        match action {
+            ButtonAction::OpenOverlay(name) => self.open_overlay(&name),
+            ButtonAction::CloseOverlay => self.close_overlay(),
+            ButtonAction::Keys(_) | ButtonAction::None => false,
+        }
+    }
+
     fn draw(
         &mut self,
         config: &Config,
@@ -707,14 +926,11 @@ impl FunctionLayer {
             0
         };
         let (pixel_shift_x, pixel_shift_y) = pixel_shift;
-        let button_starts = self
-            .buttons
-            .iter()
-            .map(|(start, _)| *start)
-            .collect::<Vec<_>>();
+        let visible = self.visible_mut();
+        let button_starts = visible.button_starts();
         let button_spans = button_spans(LayoutSpec {
             button_starts: &button_starts,
-            virtual_button_count: self.virtual_button_count,
+            virtual_button_count: visible.virtual_button_count,
             total_width: width - pixel_shift_width as i32,
             spacing_px: BUTTON_SPACING_PX,
             x_offset: pixel_shift_x + (pixel_shift_width / 2) as f64,
@@ -731,7 +947,7 @@ impl FunctionLayer {
         c.set_font_size(32.0);
 
         for span in button_spans {
-            let button = &mut self.buttons[span.index].1;
+            let button = &mut visible.buttons[span.index].1;
 
             if !button.changed && !complete_redraw {
                 continue;
@@ -759,7 +975,6 @@ impl FunctionLayer {
             }
             if !matches!(button.image, ButtonImage::Spacer) {
                 button.set_background_color(&c, color);
-                // draw box with rounded corners
                 c.new_sub_path();
                 let left = left_edge + radius;
                 let right = (left_edge + button_width.ceil()) - radius;
@@ -818,16 +1033,24 @@ impl FunctionLayer {
         modified_regions
     }
 
-    fn hit(&self, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
-        let button_starts = self
-            .buttons
-            .iter()
-            .map(|(start, _)| *start)
-            .collect::<Vec<_>>();
+    fn hit_in_set(
+        &self,
+        width: u16,
+        height: u16,
+        x: f64,
+        y: f64,
+        key: &ButtonSetKey,
+        i: Option<usize>,
+    ) -> Option<usize> {
+        if !self.is_set_visible(key) {
+            return None;
+        }
+        let button_set = self.button_set(key)?;
+        let button_starts = button_set.button_starts();
         hit_index(
             LayoutSpec {
                 button_starts: &button_starts,
-                virtual_button_count: self.virtual_button_count,
+                virtual_button_count: button_set.virtual_button_count,
                 total_width: width as i32,
                 spacing_px: BUTTON_SPACING_PX,
                 x_offset: 0.0,
@@ -837,6 +1060,125 @@ impl FunctionLayer {
             y,
             i,
         )
+    }
+
+    #[cfg(test)]
+    fn hit(&self, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
+        self.hit_in_set(width, height, x, y, &self.visible_key(), i)
+    }
+
+    fn hit_target(&self, width: u16, height: u16, x: f64, y: f64) -> Option<(ButtonSetKey, usize)> {
+        let key = self.visible_key();
+        self.hit_in_set(width, height, x, y, &key, None)
+            .map(|index| (key, index))
+    }
+}
+
+#[cfg(test)]
+mod function_layer_tests {
+    use super::*;
+
+    fn text_button(text: &str, action: ButtonAction) -> ButtonConfig {
+        let (open_overlay, close_overlay, keys) = match action {
+            ButtonAction::Keys(keys) => (None, None, keys),
+            ButtonAction::OpenOverlay(name) => (Some(name), None, vec![]),
+            ButtonAction::CloseOverlay => (None, Some(true), vec![]),
+            ButtonAction::None => (None, None, vec![]),
+        };
+        ButtonConfig {
+            id: None,
+            icon: None,
+            text: Some(text.to_string()),
+            theme: None,
+            time: None,
+            battery: None,
+            locale: None,
+            action: keys,
+            open_overlay,
+            close_overlay,
+            stretch: None,
+            icon_width: None,
+            icon_height: None,
+        }
+    }
+
+    #[test]
+    fn opening_overlay_changes_visible_hit_behavior() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            "volume".to_string(),
+            vec![text_button("up", ButtonAction::None)],
+        );
+        let mut layer = FunctionLayer::with_config(
+            vec![
+                text_button("open", ButtonAction::OpenOverlay("volume".to_string())),
+                text_button("base", ButtonAction::None),
+            ],
+            groups,
+        );
+
+        assert_eq!(layer.hit(100, 20, 75.0, 10.0, None), Some(1));
+        assert!(layer.open_overlay("volume"));
+        assert_eq!(layer.hit(100, 20, 75.0, 10.0, None), Some(0));
+    }
+
+    #[test]
+    fn closing_overlay_returns_to_base() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            "volume".to_string(),
+            vec![text_button("close", ButtonAction::CloseOverlay)],
+        );
+        let mut layer = FunctionLayer::with_config(
+            vec![
+                text_button("open", ButtonAction::OpenOverlay("volume".to_string())),
+                text_button("base", ButtonAction::None),
+            ],
+            groups,
+        );
+
+        assert!(layer.open_overlay("volume"));
+        assert_eq!(layer.hit(100, 20, 75.0, 10.0, None), Some(0));
+        assert!(layer.close_overlay());
+        assert_eq!(layer.hit(100, 20, 75.0, 10.0, None), Some(1));
+    }
+
+    #[test]
+    fn key_action_does_not_change_overlay_state() {
+        let mut layer = FunctionLayer::with_config(
+            vec![text_button("key", ButtonAction::Keys(vec![Key::F1]))],
+            HashMap::new(),
+        );
+
+        assert!(!layer.activate_button_action(ButtonAction::Keys(vec![Key::F1])));
+        assert!(layer.open_overlay.is_none());
+    }
+
+    #[test]
+    fn hidden_button_set_does_not_retarget_active_touch() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            "volume".to_string(),
+            vec![text_button("up", ButtonAction::None)],
+        );
+        let mut layer = FunctionLayer::with_config(
+            vec![
+                text_button("open", ButtonAction::OpenOverlay("volume".to_string())),
+                text_button("base", ButtonAction::Keys(vec![Key::F1])),
+            ],
+            groups,
+        );
+        let base = layer.visible_key();
+
+        assert_eq!(
+            layer.hit_in_set(100, 20, 75.0, 10.0, &base, Some(1)),
+            Some(1)
+        );
+        assert!(layer.open_overlay("volume"));
+
+        assert_eq!(layer.hit(100, 20, 75.0, 10.0, None), Some(0));
+        assert_eq!(layer.hit_in_set(100, 20, 75.0, 10.0, &base, Some(1)), None);
+        assert!(layer.button_mut_in_set(&base, 1).is_some());
     }
 }
 
@@ -876,7 +1218,7 @@ where
         .unwrap();
 }
 
-fn toggle_keys<F>(uinput: &mut UInputHandle<F>, codes: &Vec<Key>, value: i32)
+fn toggle_keys<F>(uinput: &mut UInputHandle<F>, codes: &[Key], value: i32)
 where
     F: AsRawFd,
 {
@@ -992,7 +1334,7 @@ fn real_main(drm: &mut DrmBackend) {
 
     let mut digitizer: Option<InputDevice> = None;
     let mut touches = HashMap::new();
-    let mut last_redraw_ts = if layers[active_layer].faster_refresh {
+    let mut last_redraw_ts = if layers[active_layer].faster_refresh() {
         Local::now().second()
     } else {
         Local::now().minute()
@@ -1015,24 +1357,20 @@ fn real_main(drm: &mut DrmBackend) {
             next_timeout_ms = min(next_timeout_ms, pixel_shift_next_timeout_ms);
         }
 
-        let current_ts = if layers[active_layer].faster_refresh {
+        let current_ts = if layers[active_layer].faster_refresh() {
             Local::now().second()
         } else {
             Local::now().minute()
         };
-        if layers[active_layer].displays_time && (current_ts != last_redraw_ts) {
+        if layers[active_layer].displays_time() && (current_ts != last_redraw_ts) {
             needs_complete_redraw = true;
             last_redraw_ts = current_ts;
         }
-        if layers[active_layer].displays_battery {
-            for button in &mut layers[active_layer].buttons {
-                if let ButtonImage::Battery(_, _, _) = button.1.image {
-                    button.1.changed = true;
-                }
-            }
+        if layers[active_layer].displays_battery() {
+            layers[active_layer].mark_battery_buttons_changed();
         }
 
-        if needs_complete_redraw || layers[active_layer].buttons.iter().any(|b| b.1.changed) {
+        if needs_complete_redraw || layers[active_layer].any_button_changed() {
             let shift = if cfg.enable_pixel_shift {
                 pixel_shift.get()
             } else {
@@ -1103,11 +1441,17 @@ fn real_main(drm: &mut DrmBackend) {
                         TouchEvent::Down(dn) => {
                             let x = dn.x_transformed(width as u32);
                             let y = dn.y_transformed(height as u32);
-                            if let Some(btn) = layers[active_layer].hit(width, height, x, y, None) {
-                                touches.insert(dn.seat_slot(), (active_layer, btn));
-                                layers[active_layer].buttons[btn]
-                                    .1
-                                    .set_active(&mut uinput, true);
+                            if let Some((button_set, btn)) =
+                                layers[active_layer].hit_target(width, height, x, y)
+                            {
+                                touches.insert(dn.seat_slot(), (active_layer, button_set, btn));
+                                let (layer, button_set, btn) =
+                                    touches.get(&dn.seat_slot()).unwrap().clone();
+                                if let Some(button) =
+                                    layers[layer].button_mut_in_set(&button_set, btn)
+                                {
+                                    button.set_active(&mut uinput, true);
+                                }
                             }
                         }
                         TouchEvent::Motion(mtn) => {
@@ -1117,18 +1461,45 @@ fn real_main(drm: &mut DrmBackend) {
 
                             let x = mtn.x_transformed(width as u32);
                             let y = mtn.y_transformed(height as u32);
-                            let (layer, btn) = *touches.get(&mtn.seat_slot()).unwrap();
-                            let hit = layers[active_layer]
-                                .hit(width, height, x, y, Some(btn))
+                            let (layer, button_set, btn) =
+                                touches.get(&mtn.seat_slot()).unwrap().clone();
+                            let hit = layers[layer]
+                                .hit_in_set(width, height, x, y, &button_set, Some(btn))
                                 .is_some();
-                            layers[layer].buttons[btn].1.set_active(&mut uinput, hit);
+                            if let Some(button) = layers[layer].button_mut_in_set(&button_set, btn)
+                            {
+                                button.set_active(&mut uinput, hit);
+                            }
                         }
                         TouchEvent::Up(up) => {
                             if !touches.contains_key(&up.seat_slot()) {
                                 continue;
                             }
-                            let (layer, btn) = *touches.get(&up.seat_slot()).unwrap();
-                            layers[layer].buttons[btn].1.set_active(&mut uinput, false);
+                            let (layer, button_set, btn) = touches.remove(&up.seat_slot()).unwrap();
+                            let action = layers[layer].button_action_in_set(&button_set, btn);
+                            let can_activate = layers[layer].is_set_visible(&button_set);
+                            let mut hit = false;
+                            if let Some(button) = layers[layer].button_mut_in_set(&button_set, btn)
+                            {
+                                hit = button.pressed;
+                                button.set_active(&mut uinput, false);
+                            }
+                            if hit && can_activate {
+                                if let Some(action) = action {
+                                    if layers[layer].activate_button_action(action) {
+                                        for (_, (tracked_layer, tracked_set, tracked_btn)) in
+                                            touches.drain()
+                                        {
+                                            if let Some(button) = layers[tracked_layer]
+                                                .button_mut_in_set(&tracked_set, tracked_btn)
+                                            {
+                                                button.set_active(&mut uinput, false);
+                                            }
+                                        }
+                                        needs_complete_redraw = true;
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }
