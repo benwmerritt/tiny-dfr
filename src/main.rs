@@ -331,15 +331,25 @@ impl Button {
         let mut plain = Vec::new();
         let mut charging = Vec::new();
         for icon in [
-            "battery_0_bar", "battery_1_bar", "battery_2_bar", "battery_3_bar",
-            "battery_4_bar", "battery_5_bar", "battery_6_bar", "battery_full",
+            "battery_0_bar",
+            "battery_1_bar",
+            "battery_2_bar",
+            "battery_3_bar",
+            "battery_4_bar",
+            "battery_5_bar",
+            "battery_6_bar",
+            "battery_full",
         ] {
             plain.push(Self::load_battery_image(icon, theme.as_ref()));
         }
         for icon in [
-            "battery_charging_20", "battery_charging_30", "battery_charging_50",
-            "battery_charging_60", "battery_charging_80",
-            "battery_charging_90", "battery_charging_full",
+            "battery_charging_20",
+            "battery_charging_30",
+            "battery_charging_50",
+            "battery_charging_60",
+            "battery_charging_80",
+            "battery_charging_90",
+            "battery_charging_full",
         ] {
             charging.push(Self::load_battery_image(icon, theme.as_ref()));
         }
@@ -397,12 +407,12 @@ impl Button {
         match &self.image {
             ButtonImage::Time(items, _) => items.iter().any(|item| {
                 use chrono::format::{Item, Numeric};
-                match item {
+                matches!(
+                    item,
                     Item::Numeric(Numeric::Second, _)
-                    | Item::Numeric(Numeric::Nanosecond, _)
-                    | Item::Numeric(Numeric::Timestamp, _) => true,
-                    _ => false,
-                }
+                        | Item::Numeric(Numeric::Nanosecond, _)
+                        | Item::Numeric(Numeric::Timestamp, _)
+                )
             }),
             _ => false,
         }
@@ -995,8 +1005,12 @@ fn real_main(drm: &mut DrmBackend) {
                 }
                 Event::Keyboard(KeyboardEvent::Key(key)) => {
                     if key.key() == Key::Fn as u32 {
-                        if cfg.double_press_switch_layers > 0 && key.key_state() == KeyState::Pressed {
-                            if last.elapsed() < Duration::from_millis(cfg.double_press_switch_layers.into()) {
+                        if cfg.double_press_switch_layers > 0
+                            && key.key_state() == KeyState::Pressed
+                        {
+                            if last.elapsed()
+                                < Duration::from_millis(cfg.double_press_switch_layers.into())
+                            {
                                 layers.swap(0, 1);
                             }
                             last = Instant::now();

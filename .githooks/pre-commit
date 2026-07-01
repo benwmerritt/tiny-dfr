@@ -6,6 +6,13 @@ if [[ "${SKIP_RUST_HOOKS:-}" == "1" ]]; then
   exit 0
 fi
 
+if ! command -v cargo >/dev/null 2>&1 && [[ -f "$HOME/.cargo/env" ]]; then
+  # Git hooks often run with a narrower PATH than an interactive shell.
+  # Source rustup's environment file when available so user-space Rust works.
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+fi
+
 if ! command -v cargo >/dev/null 2>&1; then
   cat >&2 <<'MSG'
 Rust toolchain not found: cargo is not on PATH.
