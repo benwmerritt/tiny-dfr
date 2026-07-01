@@ -238,7 +238,13 @@ pub struct ConfigManager {
 }
 
 fn arm_inotify(inotify_fd: &Inotify) -> Option<WatchDescriptor> {
-    let flags = AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_CLOSE | AddWatchFlags::IN_ONESHOT;
+    // IN_CLOSE_WRITE only — never IN_CLOSE (which includes CLOSE_NOWRITE):
+    // the reload path itself reads this file after the watch is re-armed, and
+    // a read-triggered watch turns every reload into the next one, pinning
+    // the daemon in a 100%-CPU reload loop that also destroys any open
+    // overlay within a frame.
+    let flags =
+        AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_ONESHOT;
     match inotify_fd.add_watch(USER_CFG_PATH, flags) {
         Ok(wd) => Some(wd),
         Err(Errno::ENOENT) => None,
