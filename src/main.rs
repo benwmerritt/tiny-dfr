@@ -2093,6 +2093,19 @@ fn real_main(drm: &mut DrmBackend) {
                                 }
                             }
                         }
+                        // A canceled touch must release its key and leave the
+                        // map, exactly like Up, but never activates anything.
+                        TouchEvent::Cancel(cancel) => {
+                            if let Some((layer, button_set, btn)) =
+                                touches.remove(&cancel.seat_slot())
+                            {
+                                if let Some(button) =
+                                    layers[layer].button_mut_in_set(&button_set, btn)
+                                {
+                                    button.set_active(&mut uinput, false);
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
