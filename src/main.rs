@@ -789,10 +789,28 @@ pub struct FunctionLayer {
     base: ButtonSet,
     overlays: HashMap<String, ButtonSet>,
     overlay_stack: Vec<String>,
+    // Last time the open overlay stack was touched or changed; drives the
+    // auto-close timeout.
+    overlay_anchor: Option<Instant>,
     // Regions only: the pinned workspace strip. Static fallback content until
     // live compositor state arrives over the control socket.
     strip: ButtonSet,
     strip_generation: u64,
+}
+
+// Milliseconds until the overlay auto-close is due (0 = due now); None when
+// the timeout is disabled or no anchor is set.
+fn overlay_timeout_remaining_ms(
+    anchor: Option<Instant>,
+    now: Instant,
+    timeout: Duration,
+) -> Option<i32> {
+    if timeout.is_zero() {
+        return None;
+    }
+    let elapsed = now.saturating_duration_since(anchor?);
+    let remaining = timeout.saturating_sub(elapsed);
+    Some(remaining.as_millis().min(i32::MAX as u128) as i32)
 }
 
 fn fallback_strip_set(workspaces: &WorkspacesCfg) -> ButtonSet {
@@ -826,6 +844,7 @@ impl FunctionLayer {
             base,
             overlays,
             overlay_stack: Vec::new(),
+            overlay_anchor: None,
             strip,
             strip_generation: 0,
         }
@@ -932,12 +951,14 @@ impl FunctionLayer {
             return false;
         }
         self.overlay_stack.push(name.to_string());
+        self.overlay_anchor = Some(Instant::now());
         self.mark_visible_set_changed_and_unpressed();
         true
     }
 
     fn close_top_overlay(&mut self) -> bool {
         if self.overlay_stack.pop().is_some() {
+            self.overlay_anchor = self.has_open_overlay().then(Instant::now);
             self.mark_visible_set_changed_and_unpressed();
             true
         } else {
@@ -945,15 +966,31 @@ impl FunctionLayer {
         }
     }
 
-    // Used by the upcoming tap-outside/auto-timeout close paths.
-    #[allow(dead_code)]
     fn close_all_overlays(&mut self) -> bool {
         if self.overlay_stack.is_empty() {
             return false;
         }
         self.overlay_stack.clear();
+        self.overlay_anchor = None;
         self.mark_visible_set_changed_and_unpressed();
         true
+    }
+
+    fn has_open_overlay(&self) -> bool {
+        !self.overlay_stack.is_empty()
+    }
+
+    fn mark_overlay_touched(&mut self, now: Instant) {
+        if self.has_open_overlay() {
+            self.overlay_anchor = Some(now);
+        }
+    }
+
+    fn overlay_timeout_remaining(&self, now: Instant, timeout: Duration) -> Option<i32> {
+        if !self.has_open_overlay() {
+            return None;
+        }
+        overlay_timeout_remaining_ms(self.overlay_anchor, now, timeout)
     }
 
     fn activate_button_action(&mut self, action: ButtonAction) -> bool {
@@ -1518,6 +1555,120 @@ mod function_layer_tests {
         assert!(layer.is_set_visible(&ButtonSetKey::Strip(layer.strip_generation)));
     }
 
+    fn null_uinput() -> UInputHandle<File> {
+        UInputHandle::new(OpenOptions::new().write(true).open("/dev/null").unwrap())
+    }
+
+    #[test]
+    fn timeout_due_after_configured_idle() {
+        let t0 = Instant::now();
+        let timeout = Duration::from_millis(8000);
+
+        assert_eq!(
+            overlay_timeout_remaining_ms(Some(t0), t0, timeout),
+            Some(8000)
+        );
+        assert_eq!(
+            overlay_timeout_remaining_ms(Some(t0), t0 + Duration::from_millis(3000), timeout),
+            Some(5000)
+        );
+        assert_eq!(
+            overlay_timeout_remaining_ms(Some(t0), t0 + Duration::from_millis(9000), timeout),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn zero_timeout_never_fires() {
+        let t0 = Instant::now();
+
+        assert_eq!(
+            overlay_timeout_remaining_ms(Some(t0), t0 + Duration::from_secs(3600), Duration::ZERO),
+            None
+        );
+    }
+
+    #[test]
+    fn touch_refreshes_timeout_anchor() {
+        let mut layer = regions_layer(4);
+        let timeout = Duration::from_millis(8000);
+        assert!(layer.open_overlay("canary"));
+        let t0 = Instant::now();
+        layer.mark_overlay_touched(t0);
+
+        layer.mark_overlay_touched(t0 + Duration::from_millis(7000));
+
+        assert_eq!(
+            layer.overlay_timeout_remaining(t0 + Duration::from_millis(8000), timeout),
+            Some(7000)
+        );
+    }
+
+    #[test]
+    fn timeout_is_inert_without_an_open_overlay() {
+        let mut layer = regions_layer(4);
+        let timeout = Duration::from_millis(8000);
+        assert!(layer.open_overlay("canary"));
+        assert!(layer.close_all_overlays());
+
+        assert_eq!(
+            layer.overlay_timeout_remaining(Instant::now(), timeout),
+            None
+        );
+        // A stray touch after close must not resurrect the anchor.
+        layer.mark_overlay_touched(Instant::now());
+        assert_eq!(
+            layer.overlay_timeout_remaining(Instant::now(), timeout),
+            None
+        );
+    }
+
+    #[test]
+    fn drain_releases_all_tracked_touches() {
+        let mut uinput = null_uinput();
+        let mut layers = [regions_layer(4), regions_layer(4)];
+        let mut touches = HashMap::new();
+
+        let strip_key = ButtonSetKey::Strip(0);
+        layers[0]
+            .button_mut_in_set(&strip_key, 0)
+            .unwrap()
+            .set_active(&mut uinput, true);
+        touches.insert(1, (0usize, strip_key.clone(), 0usize));
+        layers[0]
+            .button_mut_in_set(&ButtonSetKey::Base, 1)
+            .unwrap()
+            .set_active(&mut uinput, true);
+        touches.insert(2, (0usize, ButtonSetKey::Base, 1usize));
+
+        drain_touches(&mut layers, &mut touches, &mut uinput);
+
+        assert!(touches.is_empty());
+        assert!(
+            !layers[0].button_set(&strip_key).unwrap().buttons[0]
+                .1
+                .pressed
+        );
+        assert!(
+            !layers[0].button_set(&ButtonSetKey::Base).unwrap().buttons[1]
+                .1
+                .pressed
+        );
+    }
+
+    #[test]
+    fn drain_survives_touches_on_stale_button_sets() {
+        let mut uinput = null_uinput();
+        let mut layers = [regions_layer(4), regions_layer(4)];
+        let mut touches = HashMap::new();
+        touches.insert(1, (0usize, ButtonSetKey::Strip(99), 0usize));
+        touches.insert(2, (0usize, ButtonSetKey::Overlay("gone".into()), 0usize));
+
+        drain_touches(&mut layers, &mut touches, &mut uinput);
+
+        assert!(touches.is_empty());
+    }
+
     #[test]
     fn classic_layer_has_no_strip_targets() {
         let layer = FunctionLayer::with_config(
@@ -1616,6 +1767,25 @@ where
         SynchronizeKind::Report as u16,
         0,
     );
+}
+
+// The single invalidation path for the touch map: every route that hides or
+// replaces buttons (overlay transitions, timeout close, layer flips, config
+// reloads) must release in-flight touches through here so no virtual key is
+// ever stranded down.
+fn drain_touches<K, F>(
+    layers: &mut [FunctionLayer; 2],
+    touches: &mut HashMap<K, (usize, ButtonSetKey, usize)>,
+    uinput: &mut UInputHandle<F>,
+) where
+    K: Eq + std::hash::Hash,
+    F: AsRawFd,
+{
+    for (_, (layer, set, btn)) in touches.drain() {
+        if let Some(button) = layers[layer].button_mut_in_set(&set, btn) {
+            button.set_active(uinput, false);
+        }
+    }
 }
 
 fn main() {
@@ -1722,7 +1892,13 @@ fn real_main(drm: &mut DrmBackend) {
         Local::now().minute()
     };
     loop {
-        if cfg_mgr.update_config(&mut cfg, &mut layers, width) {
+        if cfg_mgr.reload_pending() {
+            // Release in-flight touches against the outgoing layers before
+            // they are dropped, or their key-down events would be stranded.
+            drain_touches(&mut layers, &mut touches, &mut uinput);
+            let parts = cfg_mgr.load_config(width);
+            cfg = parts.0;
+            layers = parts.1;
             active_layer = 0;
             needs_complete_redraw = true;
         }
@@ -1737,6 +1913,20 @@ fn real_main(drm: &mut DrmBackend) {
                 needs_complete_redraw = true;
             }
             next_timeout_ms = min(next_timeout_ms, pixel_shift_next_timeout_ms);
+        }
+
+        if let Some(remaining) =
+            layers[active_layer].overlay_timeout_remaining(Instant::now(), cfg.overlay_timeout)
+        {
+            if remaining > 0 {
+                next_timeout_ms = min(next_timeout_ms, remaining);
+            } else if touches.is_empty() {
+                // Never auto-close under an active touch; the anchor refreshes
+                // on release, restarting the idle window.
+                if layers[active_layer].close_all_overlays() {
+                    needs_complete_redraw = true;
+                }
+            }
         }
 
         let current_ts = if layers[active_layer].faster_refresh() {
@@ -1801,6 +1991,9 @@ fn real_main(drm: &mut DrmBackend) {
                             if last.elapsed()
                                 < Duration::from_millis(cfg.double_press_switch_layers.into())
                             {
+                                // Swapping invalidates the layer indices held
+                                // by in-flight touches; release them first.
+                                drain_touches(&mut layers, &mut touches, &mut uinput);
                                 layers.swap(0, 1);
                             }
                             last = Instant::now();
@@ -1810,6 +2003,8 @@ fn real_main(drm: &mut DrmBackend) {
                             KeyState::Released => 0,
                         };
                         if active_layer != new_layer {
+                            drain_touches(&mut layers, &mut touches, &mut uinput);
+                            layers[active_layer].close_all_overlays();
                             active_layer = new_layer;
                             needs_complete_redraw = true;
                         }
@@ -1819,12 +2014,24 @@ fn real_main(drm: &mut DrmBackend) {
                     if Some(te.device()) != digitizer || backlight.current_bl() == 0 {
                         continue;
                     }
+                    // Any touch on the bar counts as overlay activity.
+                    layers[active_layer].mark_overlay_touched(Instant::now());
                     match te {
                         TouchEvent::Down(dn) => {
                             let x = dn.x_transformed(width as u32);
                             let y = dn.y_transformed(height as u32);
                             match layers[active_layer].hit_target(width, height, x, y) {
                                 HitOutcome::Button(button_set, btn) => {
+                                    // A workspace tap while an overlay is open
+                                    // closes the whole stack AND performs the
+                                    // switch in the same tap.
+                                    if matches!(button_set, ButtonSetKey::Strip(_))
+                                        && layers[active_layer].has_open_overlay()
+                                    {
+                                        drain_touches(&mut layers, &mut touches, &mut uinput);
+                                        layers[active_layer].close_all_overlays();
+                                        needs_complete_redraw = true;
+                                    }
                                     touches.insert(dn.seat_slot(), (active_layer, button_set, btn));
                                     let (layer, button_set, btn) =
                                         touches.get(&dn.seat_slot()).unwrap().clone();
@@ -1834,9 +2041,17 @@ fn real_main(drm: &mut DrmBackend) {
                                         button.set_active(&mut uinput, true);
                                     }
                                 }
-                                // Tap-outside close semantics land with the
-                                // auto-timeout work.
-                                HitOutcome::OutsideControls | HitOutcome::Miss => {}
+                                // iPhone-folder rule: touching anywhere outside
+                                // the overlay's buttons dismisses the stack on
+                                // Down. The touch is not recorded, so its
+                                // release cannot activate anything.
+                                HitOutcome::OutsideControls => {
+                                    drain_touches(&mut layers, &mut touches, &mut uinput);
+                                    if layers[active_layer].close_all_overlays() {
+                                        needs_complete_redraw = true;
+                                    }
+                                }
+                                HitOutcome::Miss => {}
                             }
                         }
                         TouchEvent::Motion(mtn) => {
@@ -1872,15 +2087,7 @@ fn real_main(drm: &mut DrmBackend) {
                             if hit && can_activate {
                                 if let Some(action) = action {
                                     if layers[layer].activate_button_action(action) {
-                                        for (_, (tracked_layer, tracked_set, tracked_btn)) in
-                                            touches.drain()
-                                        {
-                                            if let Some(button) = layers[tracked_layer]
-                                                .button_mut_in_set(&tracked_set, tracked_btn)
-                                            {
-                                                button.set_active(&mut uinput, false);
-                                            }
-                                        }
+                                        drain_touches(&mut layers, &mut touches, &mut uinput);
                                         needs_complete_redraw = true;
                                     }
                                 }

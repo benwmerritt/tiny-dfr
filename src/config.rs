@@ -12,9 +12,10 @@ use serde::{
     de::{self, Visitor},
     Deserialize, Deserializer,
 };
-use std::{collections::HashMap, fmt, fs::read_to_string, os::fd::AsFd};
+use std::{collections::HashMap, fmt, fs::read_to_string, os::fd::AsFd, time::Duration};
 
 const USER_CFG_PATH: &str = "/etc/tiny-dfr/config.toml";
+const DEFAULT_OVERLAY_TIMEOUT_MS: u64 = 8000;
 
 pub struct Config {
     pub show_button_outlines: bool,
@@ -23,6 +24,8 @@ pub struct Config {
     pub adaptive_brightness: bool,
     pub active_brightness: u32,
     pub double_press_switch_layers: u32,
+    // Zero disables auto-close.
+    pub overlay_timeout: Duration,
 }
 
 #[derive(Deserialize)]
@@ -35,6 +38,7 @@ struct ConfigProxy {
     adaptive_brightness: Option<bool>,
     active_brightness: Option<u32>,
     double_press_switch_layers: Option<u32>,
+    overlay_timeout_ms: Option<u64>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
     control_groups: Option<HashMap<String, Vec<ButtonConfig>>>,
@@ -180,6 +184,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         base.primary_layer_keys = user.primary_layer_keys.or(base.primary_layer_keys);
         base.control_groups = user.control_groups.or(base.control_groups);
         base.workspaces = user.workspaces.or(base.workspaces);
+        base.overlay_timeout_ms = user.overlay_timeout_ms.or(base.overlay_timeout_ms);
         base.active_brightness = user.active_brightness.or(base.active_brightness);
         base.double_press_switch_layers = user
             .double_press_switch_layers
@@ -219,6 +224,10 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         font_face: load_font(&base.font_template.unwrap()),
         active_brightness: base.active_brightness.unwrap(),
         double_press_switch_layers: base.double_press_switch_layers.unwrap(),
+        overlay_timeout: Duration::from_millis(
+            base.overlay_timeout_ms
+                .unwrap_or(DEFAULT_OVERLAY_TIMEOUT_MS),
+        ),
     };
     (cfg, layers)
 }
@@ -249,37 +258,26 @@ impl ConfigManager {
     pub fn load_config(&self, width: u16) -> (Config, [FunctionLayer; 2]) {
         load_config(width)
     }
-    pub fn update_config(
-        &mut self,
-        cfg: &mut Config,
-        layers: &mut [FunctionLayer; 2],
-        width: u16,
-    ) -> bool {
+    // Detection is split from application so the caller can release any
+    // in-flight touches (emitting key-up through uinput) before the old
+    // layers are dropped by a reload.
+    pub fn reload_pending(&mut self) -> bool {
         if self.watch_desc.is_none() {
             self.watch_desc = arm_inotify(&self.inotify_fd);
             return false;
         }
         match self.inotify_fd.read_events() {
             Err(Errno::EAGAIN) => false,
-            r => self.handle_events(cfg, layers, width, r),
+            r => self.handle_events(r),
         }
     }
     #[cold]
-    fn handle_events(
-        &mut self,
-        cfg: &mut Config,
-        layers: &mut [FunctionLayer; 2],
-        width: u16,
-        evts: Result<Vec<InotifyEvent>, Errno>,
-    ) -> bool {
+    fn handle_events(&mut self, evts: Result<Vec<InotifyEvent>, Errno>) -> bool {
         let mut ret = false;
         for evt in evts.unwrap() {
             if Some(evt.wd) != self.watch_desc {
                 continue;
             }
-            let parts = load_config(width);
-            *cfg = parts.0;
-            *layers = parts.1;
             ret = true;
             self.watch_desc = arm_inotify(&self.inotify_fd);
         }
