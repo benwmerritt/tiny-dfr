@@ -75,6 +75,17 @@ rollback_to_stock() {
   systemctl enable --now tiny-dfr.service
 }
 
+# Snapshot the currently-installed binary/config pair as last-good before
+# overwriting. Installs happen at milestone boundaries after a passed hardware
+# test, so whatever is installed right now is the last bar that worked.
+# Restore with: sudo scripts/rollback-ben-last-good.sh
+if [[ -x /usr/local/bin/tiny-dfr-ben ]]; then
+  cp -a /usr/local/bin/tiny-dfr-ben /usr/local/bin/tiny-dfr-ben.last-good
+  if [[ -f /etc/tiny-dfr/config.toml ]]; then
+    cp -a /etc/tiny-dfr/config.toml /etc/tiny-dfr/config.toml.last-good
+  fi
+fi
+
 install -o root -g root -m 0755 "$binary_src" /usr/local/bin/tiny-dfr-ben
 install -d -m 0755 /etc/tiny-dfr
 
