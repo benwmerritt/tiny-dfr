@@ -45,12 +45,14 @@ mod backlight;
 mod config;
 mod display;
 mod fonts;
+mod layout;
 mod pixel_shift;
 
 use crate::config::ConfigManager;
 use backlight::BacklightManager;
 use config::{ButtonConfig, Config};
 use display::DrmBackend;
+use layout::{button_spans, hit_index, LayoutSpec};
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 
 const BUTTON_SPACING_PX: i32 = 16;
@@ -612,14 +614,22 @@ impl FunctionLayer {
         } else {
             0
         };
-        let virtual_button_width = ((width - pixel_shift_width as i32)
-            - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32))
-            as f64
-            / self.virtual_button_count as f64;
+        let (pixel_shift_x, pixel_shift_y) = pixel_shift;
+        let button_starts = self
+            .buttons
+            .iter()
+            .map(|(start, _)| *start)
+            .collect::<Vec<_>>();
+        let button_spans = button_spans(LayoutSpec {
+            button_starts: &button_starts,
+            virtual_button_count: self.virtual_button_count,
+            total_width: width - pixel_shift_width as i32,
+            spacing_px: BUTTON_SPACING_PX,
+            x_offset: pixel_shift_x + (pixel_shift_width / 2) as f64,
+        });
         let radius = 8.0f64;
         let bot = (height as f64) * 0.15;
         let top = (height as f64) * 0.85;
-        let (pixel_shift_x, pixel_shift_y) = pixel_shift;
 
         if complete_redraw {
             c.set_source_rgb(0.0, 0.0, 0.0);
@@ -628,27 +638,15 @@ impl FunctionLayer {
         c.set_font_face(&config.font_face);
         c.set_font_size(32.0);
 
-        for i in 0..self.buttons.len() {
-            let end = if i + 1 < self.buttons.len() {
-                self.buttons[i + 1].0
-            } else {
-                self.virtual_button_count
-            };
-            let (start, button) = &mut self.buttons[i];
-            let start = *start;
+        for span in button_spans {
+            let button = &mut self.buttons[span.index].1;
 
             if !button.changed && !complete_redraw {
                 continue;
             };
 
-            let left_edge = (start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
-                .floor()
-                + pixel_shift_x
-                + (pixel_shift_width / 2) as f64;
-
-            let button_width = virtual_button_width
-                + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
-                    .floor();
+            let left_edge = span.left_edge;
+            let button_width = span.width;
 
             let color = if button.active {
                 BUTTON_COLOR_ACTIVE
@@ -729,44 +727,24 @@ impl FunctionLayer {
     }
 
     fn hit(&self, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
-        let virtual_button_width =
-            (width as i32 - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32)) as f64
-                / self.virtual_button_count as f64;
-
-        let i = i.unwrap_or_else(|| {
-            let virtual_i = (x / (width as f64 / self.virtual_button_count as f64)) as usize;
-            self.buttons
-                .iter()
-                .position(|(start, _)| *start > virtual_i)
-                .unwrap_or(self.buttons.len())
-                - 1
-        });
-        if i >= self.buttons.len() {
-            return None;
-        }
-
-        let start = self.buttons[i].0;
-        let end = if i + 1 < self.buttons.len() {
-            self.buttons[i + 1].0
-        } else {
-            self.virtual_button_count
-        };
-
-        let left_edge = (start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64)).floor();
-
-        let button_width = virtual_button_width
-            + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
-                .floor();
-
-        if x < left_edge
-            || x > (left_edge + button_width)
-            || y < 0.1 * height as f64
-            || y > 0.9 * height as f64
-        {
-            return None;
-        }
-
-        Some(i)
+        let button_starts = self
+            .buttons
+            .iter()
+            .map(|(start, _)| *start)
+            .collect::<Vec<_>>();
+        hit_index(
+            LayoutSpec {
+                button_starts: &button_starts,
+                virtual_button_count: self.virtual_button_count,
+                total_width: width as i32,
+                spacing_px: BUTTON_SPACING_PX,
+                x_offset: 0.0,
+            },
+            height,
+            x,
+            y,
+            i,
+        )
     }
 }
 
