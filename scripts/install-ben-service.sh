@@ -116,16 +116,26 @@ systemctl reset-failed tiny-dfr-ben.service tiny-dfr.service || true
 
 # tiny-dfr owns the Touch Bar DRM/input/uinput devices, so only one instance
 # should run at a time.
-if ! systemctl stop tiny-dfr.service; then
-  echo "Failed to stop stock tiny-dfr.service; aborting without starting fork." >&2
-  rollback_to_stock
-  exit 1
+if systemctl is-active --quiet tiny-dfr.service; then
+  if ! systemctl stop tiny-dfr.service; then
+    echo "Failed to stop stock tiny-dfr.service; aborting without starting fork." >&2
+    rollback_to_stock
+    exit 1
+  fi
 fi
 
-if ! systemctl start tiny-dfr-ben.service; then
-  echo "Failed to start tiny-dfr-ben.service." >&2
-  rollback_to_stock
-  exit 1
+if systemctl is-active --quiet tiny-dfr-ben.service; then
+  if ! systemctl restart tiny-dfr-ben.service; then
+    echo "Failed to restart tiny-dfr-ben.service." >&2
+    rollback_to_stock
+    exit 1
+  fi
+else
+  if ! systemctl start tiny-dfr-ben.service; then
+    echo "Failed to start tiny-dfr-ben.service." >&2
+    rollback_to_stock
+    exit 1
+  fi
 fi
 sleep 2
 
