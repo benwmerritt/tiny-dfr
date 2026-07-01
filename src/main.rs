@@ -620,19 +620,8 @@ mod button_tests {
 
     fn text_button_config(text: &str) -> ButtonConfig {
         ButtonConfig {
-            id: None,
-            icon: None,
             text: Some(text.to_string()),
-            theme: None,
-            time: None,
-            battery: None,
-            locale: None,
-            action: vec![],
-            open_overlay: None,
-            close_overlay: None,
-            stretch: None,
-            icon_width: None,
-            icon_height: None,
+            ..Default::default()
         }
     }
 
@@ -775,11 +764,15 @@ impl ButtonSet {
     }
 }
 
+// Defensive bound on overlay nesting so a config with an OpenOverlay cycle
+// cannot grow the stack without limit.
+const MAX_OVERLAY_DEPTH: usize = 8;
+
 #[derive(Default)]
 pub struct FunctionLayer {
     base: ButtonSet,
     overlays: HashMap<String, ButtonSet>,
-    open_overlay: Option<String>,
+    overlay_stack: Vec<String>,
 }
 
 impl FunctionLayer {
@@ -795,14 +788,13 @@ impl FunctionLayer {
         FunctionLayer {
             base,
             overlays,
-            open_overlay: None,
+            overlay_stack: Vec::new(),
         }
     }
 
     fn visible_key(&self) -> ButtonSetKey {
-        self.open_overlay
-            .as_ref()
-            .filter(|name| self.overlays.contains_key(*name))
+        self.overlay_stack
+            .last()
             .map(|name| ButtonSetKey::Overlay(name.clone()))
             .unwrap_or(ButtonSetKey::Base)
     }
@@ -870,35 +862,49 @@ impl FunctionLayer {
             .map(|(_, button)| button.action.clone())
     }
 
+    fn mark_visible_set_changed_and_unpressed(&mut self) {
+        for (_, button) in &mut self.visible_mut().buttons {
+            button.changed = true;
+            button.pressed = false;
+        }
+    }
+
     fn open_overlay(&mut self, name: &str) -> bool {
-        if self.overlays.contains_key(name) {
-            self.open_overlay = Some(name.to_string());
-            for (_, button) in &mut self.visible_mut().buttons {
-                button.changed = true;
-                button.pressed = false;
-            }
+        if !self.overlays.contains_key(name)
+            || self.overlay_stack.last().is_some_and(|top| top == name)
+            || self.overlay_stack.len() >= MAX_OVERLAY_DEPTH
+        {
+            return false;
+        }
+        self.overlay_stack.push(name.to_string());
+        self.mark_visible_set_changed_and_unpressed();
+        true
+    }
+
+    fn close_top_overlay(&mut self) -> bool {
+        if self.overlay_stack.pop().is_some() {
+            self.mark_visible_set_changed_and_unpressed();
             true
         } else {
             false
         }
     }
 
-    fn close_overlay(&mut self) -> bool {
-        if self.open_overlay.take().is_some() {
-            for (_, button) in &mut self.base.buttons {
-                button.changed = true;
-                button.pressed = false;
-            }
-            true
-        } else {
-            false
+    // Used by the upcoming tap-outside/auto-timeout close paths.
+    #[allow(dead_code)]
+    fn close_all_overlays(&mut self) -> bool {
+        if self.overlay_stack.is_empty() {
+            return false;
         }
+        self.overlay_stack.clear();
+        self.mark_visible_set_changed_and_unpressed();
+        true
     }
 
     fn activate_button_action(&mut self, action: ButtonAction) -> bool {
         match action {
             ButtonAction::OpenOverlay(name) => self.open_overlay(&name),
-            ButtonAction::CloseOverlay => self.close_overlay(),
+            ButtonAction::CloseOverlay => self.close_top_overlay(),
             ButtonAction::Keys(_) | ButtonAction::None => false,
         }
     }
@@ -1086,19 +1092,11 @@ mod function_layer_tests {
             ButtonAction::None => (None, None, vec![]),
         };
         ButtonConfig {
-            id: None,
-            icon: None,
             text: Some(text.to_string()),
-            theme: None,
-            time: None,
-            battery: None,
-            locale: None,
             action: keys,
             open_overlay,
             close_overlay,
-            stretch: None,
-            icon_width: None,
-            icon_height: None,
+            ..Default::default()
         }
     }
 
@@ -1139,7 +1137,7 @@ mod function_layer_tests {
 
         assert!(layer.open_overlay("volume"));
         assert_eq!(layer.hit(100, 20, 75.0, 10.0, None), Some(0));
-        assert!(layer.close_overlay());
+        assert!(layer.close_top_overlay());
         assert_eq!(layer.hit(100, 20, 75.0, 10.0, None), Some(1));
     }
 
@@ -1151,7 +1149,98 @@ mod function_layer_tests {
         );
 
         assert!(!layer.activate_button_action(ButtonAction::Keys(vec![Key::F1])));
-        assert!(layer.open_overlay.is_none());
+        assert!(layer.overlay_stack.is_empty());
+    }
+
+    fn nested_layer() -> FunctionLayer {
+        let mut groups = HashMap::new();
+        groups.insert(
+            "sound".to_string(),
+            vec![
+                text_button("vol", ButtonAction::OpenOverlay("volume".to_string())),
+                text_button("play", ButtonAction::None),
+            ],
+        );
+        groups.insert(
+            "volume".to_string(),
+            vec![text_button("slider", ButtonAction::None)],
+        );
+        FunctionLayer::with_config(
+            vec![text_button(
+                "open",
+                ButtonAction::OpenOverlay("sound".to_string()),
+            )],
+            groups,
+        )
+    }
+
+    #[test]
+    fn nested_open_shows_innermost_overlay() {
+        let mut layer = nested_layer();
+
+        assert!(layer.open_overlay("sound"));
+        assert!(layer.open_overlay("volume"));
+
+        assert_eq!(
+            layer.visible_key(),
+            ButtonSetKey::Overlay("volume".to_string())
+        );
+    }
+
+    #[test]
+    fn close_all_returns_to_base_from_depth_two() {
+        let mut layer = nested_layer();
+        assert!(layer.open_overlay("sound"));
+        assert!(layer.open_overlay("volume"));
+
+        assert!(layer.close_all_overlays());
+
+        assert_eq!(layer.visible_key(), ButtonSetKey::Base);
+        assert!(!layer.close_all_overlays());
+    }
+
+    #[test]
+    fn close_overlay_action_pops_one_level() {
+        let mut layer = nested_layer();
+        assert!(layer.open_overlay("sound"));
+        assert!(layer.open_overlay("volume"));
+
+        assert!(layer.activate_button_action(ButtonAction::CloseOverlay));
+
+        assert_eq!(
+            layer.visible_key(),
+            ButtonSetKey::Overlay("sound".to_string())
+        );
+    }
+
+    #[test]
+    fn reopening_top_overlay_is_a_noop() {
+        let mut layer = nested_layer();
+        assert!(layer.open_overlay("sound"));
+
+        assert!(!layer.open_overlay("sound"));
+
+        assert_eq!(layer.overlay_stack.len(), 1);
+    }
+
+    #[test]
+    fn overlay_stack_depth_is_bounded() {
+        let mut layer = nested_layer();
+        for _ in 0..2 * MAX_OVERLAY_DEPTH {
+            layer.open_overlay("sound");
+            layer.open_overlay("volume");
+        }
+
+        assert!(layer.overlay_stack.len() <= MAX_OVERLAY_DEPTH);
+    }
+
+    #[test]
+    fn opening_missing_overlay_is_rejected() {
+        let mut layer = nested_layer();
+
+        assert!(!layer.open_overlay("does-not-exist"));
+
+        assert_eq!(layer.visible_key(), ButtonSetKey::Base);
     }
 
     #[test]

@@ -67,7 +67,7 @@ where
     deserializer.deserialize_any(ArrayOrSingle)
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ButtonConfig {
     pub id: Option<String>,
@@ -131,19 +131,9 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
             layer.insert(
                 0,
                 ButtonConfig {
-                    id: None,
-                    icon: None,
                     text: Some("esc".into()),
-                    theme: None,
                     action: vec![Key::Esc],
-                    open_overlay: None,
-                    close_overlay: None,
-                    stretch: None,
-                    time: None,
-                    locale: None,
-                    battery: None,
-                    icon_width: None,
-                    icon_height: None,
+                    ..Default::default()
                 },
             );
         }
