@@ -37,11 +37,18 @@ impl SysfsSlider {
             .write(true)
             .open(&attr_path)
             .with_context(|| format!("opening {} for write", attr_path.display()))?;
+        // A NaN min_fraction would become a NaN clamp *bound* in raw_for,
+        // which panics — never let one in.
+        let min_fraction = if min_fraction.is_finite() {
+            min_fraction.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         Ok(SysfsSlider {
             write_handle,
             attr_path,
             max,
-            min_fraction: min_fraction.clamp(0.0, 1.0),
+            min_fraction,
             write_error_logged: false,
         })
     }
@@ -61,10 +68,13 @@ impl SysfsSlider {
             return;
         }
         let raw = self.raw_for(value);
-        if let Err(e) = self.write_handle.write_all(format!("{}\n", raw).as_bytes()) {
-            if !self.write_error_logged {
-                eprintln!("slider write to {} failed: {e}", self.attr_path.display());
-                self.write_error_logged = true;
+        match self.write_handle.write_all(format!("{}\n", raw).as_bytes()) {
+            Ok(()) => self.write_error_logged = false,
+            Err(e) => {
+                if !self.write_error_logged {
+                    eprintln!("slider write to {} failed: {e}", self.attr_path.display());
+                    self.write_error_logged = true;
+                }
             }
         }
     }

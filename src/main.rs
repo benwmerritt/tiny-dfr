@@ -91,19 +91,38 @@ fn slider_value_from_x(span_left: f64, span_width: f64, x: f64) -> f64 {
     ((x - track_left) / track_len).clamp(0.0, 1.0)
 }
 
+const SLIDER_TARGET_COUNT: usize = 3;
+
+fn slider_target_index(target: SliderTarget) -> usize {
+    match target {
+        SliderTarget::DisplayBrightness => 0,
+        SliderTarget::KeyboardBrightness => 1,
+        SliderTarget::Volume => 2,
+    }
+}
+
+fn slider_target_from_index(index: usize) -> SliderTarget {
+    match index {
+        0 => SliderTarget::DisplayBrightness,
+        1 => SliderTarget::KeyboardBrightness,
+        _ => SliderTarget::Volume,
+    }
+}
+
 // Latest-wins rate limiter for slider emissions: at most one value per
-// interval flows to sysfs/socket while a drag is in flight; the final value
-// is always flushed on release.
+// interval flows to sysfs/socket while drags are in flight; the final value
+// of each drag always lands on release. Pending values are per target so
+// concurrent drags on different sliders can't drop each other's finals.
 struct EmitThrottle {
     last_emit: Option<Instant>,
-    pending: Option<(SliderTarget, f64)>,
+    pending: [Option<f64>; SLIDER_TARGET_COUNT],
 }
 
 impl EmitThrottle {
     fn new() -> EmitThrottle {
         EmitThrottle {
             last_emit: None,
-            pending: None,
+            pending: [None; SLIDER_TARGET_COUNT],
         }
     }
 
@@ -113,7 +132,7 @@ impl EmitThrottle {
     }
 
     // Offer a new value: emitted immediately when due, otherwise stored
-    // (replacing any older pending value).
+    // (replacing any older pending value for the same target).
     fn offer(
         &mut self,
         target: SliderTarget,
@@ -122,32 +141,42 @@ impl EmitThrottle {
     ) -> Option<(SliderTarget, f64)> {
         if self.due(now) {
             self.last_emit = Some(now);
-            self.pending = None;
+            self.pending[slider_target_index(target)] = None;
             Some((target, value))
         } else {
-            self.pending = Some((target, value));
+            self.pending[slider_target_index(target)] = Some(value);
             None
         }
     }
 
-    // Emit the stored value once the interval has elapsed.
+    // Emit one stored value once the interval has elapsed; any further
+    // pending target lands on a subsequent loop iteration.
     fn take_due(&mut self, now: Instant) -> Option<(SliderTarget, f64)> {
-        if self.pending.is_some() && self.due(now) {
-            self.last_emit = Some(now);
-            self.pending.take()
-        } else {
-            None
+        if !self.due(now) {
+            return None;
         }
+        for index in 0..SLIDER_TARGET_COUNT {
+            if let Some(value) = self.pending[index].take() {
+                self.last_emit = Some(now);
+                return Some((slider_target_from_index(index), value));
+            }
+        }
+        None
     }
 
-    // Unconditional flush (drag ended: the final position always lands).
-    fn flush(&mut self) -> Option<(SliderTarget, f64)> {
-        self.pending.take()
+    // Drag ended: the target's final position always lands, and counts
+    // against the rate clock.
+    fn flush(&mut self, target: SliderTarget, now: Instant) -> Option<(SliderTarget, f64)> {
+        let value = self.pending[slider_target_index(target)].take()?;
+        self.last_emit = Some(now);
+        Some((target, value))
     }
 
     // How long the event loop may sleep before a pending value is due.
     fn pending_wait_ms(&self, now: Instant) -> Option<i32> {
-        self.pending.as_ref()?;
+        if self.pending.iter().all(|p| p.is_none()) {
+            return None;
+        }
         let last = self.last_emit?;
         let elapsed = now.saturating_duration_since(last);
         Some(
@@ -2017,13 +2046,52 @@ OpenOverlay = "volume""#,
             throttle.take_due(t0 + Duration::from_millis(60)),
             Some((SliderTarget::Volume, 0.2))
         );
-        // Final flush is unconditional.
+        // Final flush is unconditional for the drag's own target.
         assert_eq!(
             throttle.offer(SliderTarget::Volume, 0.3, t0 + Duration::from_millis(70)),
             None
         );
-        assert_eq!(throttle.flush(), Some((SliderTarget::Volume, 0.3)));
-        assert_eq!(throttle.flush(), None);
+        let t_flush = t0 + Duration::from_millis(80);
+        assert_eq!(
+            throttle.flush(SliderTarget::Volume, t_flush),
+            Some((SliderTarget::Volume, 0.3))
+        );
+        assert_eq!(throttle.flush(SliderTarget::Volume, t_flush), None);
+    }
+
+    #[test]
+    fn throttle_keeps_pending_values_per_target() {
+        let mut throttle = EmitThrottle::new();
+        let t0 = Instant::now();
+        throttle.offer(SliderTarget::Volume, 0.1, t0);
+
+        // Two targets pend within the same interval; neither drops the other.
+        assert_eq!(
+            throttle.offer(
+                SliderTarget::DisplayBrightness,
+                0.5,
+                t0 + Duration::from_millis(10)
+            ),
+            None
+        );
+        assert_eq!(
+            throttle.offer(
+                SliderTarget::KeyboardBrightness,
+                0.7,
+                t0 + Duration::from_millis(20)
+            ),
+            None
+        );
+
+        assert_eq!(
+            throttle.take_due(t0 + Duration::from_millis(60)),
+            Some((SliderTarget::DisplayBrightness, 0.5))
+        );
+        assert_eq!(
+            throttle.take_due(t0 + Duration::from_millis(120)),
+            Some((SliderTarget::KeyboardBrightness, 0.7))
+        );
+        assert_eq!(throttle.take_due(t0 + Duration::from_millis(180)), None);
     }
 
     fn slider_layer() -> FunctionLayer {
@@ -2244,6 +2312,15 @@ fn drain_touches<K, F>(
     for (_, (layer, set, btn)) in touches.drain() {
         if let Some(button) = layers[layer].button_mut_in_set(&set, btn) {
             button.set_active(uinput, false);
+            // An aborted drag must not leave `dragging` stranded true, or
+            // sync_sliders would refuse to re-seed this slider until the
+            // next completed drag on it.
+            if let Some(state) = button.slider_state_mut() {
+                if state.dragging {
+                    state.dragging = false;
+                    button.changed = true;
+                }
+            }
         }
         // An unresolvable set here must only ever hold already-released
         // entries: any path that makes a set unreachable (strip generation
@@ -2355,6 +2432,11 @@ fn real_main(drm: &mut DrmBackend) {
 
     let mut digitizer: Option<InputDevice> = None;
     let mut touches = HashMap::new();
+    // Seed any sliders visible at startup (base-layer sliders would otherwise
+    // render at 0.0 until the first overlay transition).
+    for layer in layers.iter_mut() {
+        layer.sync_sliders(&slider_backends);
+    }
     let mut last_redraw_ts = if layers[active_layer].faster_refresh() {
         Local::now().second()
     } else {
@@ -2393,6 +2475,7 @@ fn real_main(drm: &mut DrmBackend) {
                 // Never auto-close under an active touch; the anchor refreshes
                 // on release, restarting the idle window.
                 if layers[active_layer].close_all_overlays() {
+                    layers[active_layer].sync_sliders(&slider_backends);
                     needs_complete_redraw = true;
                 }
             }
@@ -2519,6 +2602,12 @@ fn real_main(drm: &mut DrmBackend) {
                                             layers[old_layer].button_mut_in_set(&old_set, old_btn)
                                         {
                                             button.set_active(&mut uinput, false);
+                                            if let Some(state) = button.slider_state_mut() {
+                                                if state.dragging {
+                                                    state.dragging = false;
+                                                    button.changed = true;
+                                                }
+                                            }
                                         }
                                     }
                                     if let Some(target) =
@@ -2575,6 +2664,7 @@ fn real_main(drm: &mut DrmBackend) {
                                 HitOutcome::OutsideControls => {
                                     drain_touches(&mut layers, &mut touches, &mut uinput);
                                     if layers[active_layer].close_all_overlays() {
+                                        layers[active_layer].sync_sliders(&slider_backends);
                                         needs_complete_redraw = true;
                                     }
                                 }
@@ -2629,10 +2719,11 @@ fn real_main(drm: &mut DrmBackend) {
                                 continue;
                             }
                             let (layer, button_set, btn) = touches.remove(&up.seat_slot()).unwrap();
-                            if layers[layer].slider_target_at(&button_set, btn).is_some() {
+                            if let Some(target) = layers[layer].slider_target_at(&button_set, btn) {
                                 // Drag ended: the last position always lands.
                                 layers[layer].update_slider(&button_set, btn, None, false);
-                                if let Some((t, v)) = slider_throttle.flush() {
+                                if let Some((t, v)) = slider_throttle.flush(target, Instant::now())
+                                {
                                     emit_slider(t, v, &mut slider_backends);
                                 }
                                 continue;
@@ -2661,9 +2752,13 @@ fn real_main(drm: &mut DrmBackend) {
                             if let Some((layer, button_set, btn)) =
                                 touches.remove(&cancel.seat_slot())
                             {
-                                if layers[layer].slider_target_at(&button_set, btn).is_some() {
+                                if let Some(target) =
+                                    layers[layer].slider_target_at(&button_set, btn)
+                                {
                                     layers[layer].update_slider(&button_set, btn, None, false);
-                                    if let Some((t, v)) = slider_throttle.flush() {
+                                    if let Some((t, v)) =
+                                        slider_throttle.flush(target, Instant::now())
+                                    {
                                         emit_slider(t, v, &mut slider_backends);
                                     }
                                 } else if let Some(button) =

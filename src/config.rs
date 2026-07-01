@@ -212,7 +212,22 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
             .double_press_switch_layers
             .or(base.double_press_switch_layers);
     };
-    let control_groups = base.control_groups.unwrap_or_default();
+    // An empty group would panic in ButtonSet::with_config — and on an
+    // inotify-driven reload that panic kills the bar until a manual restart.
+    // A config typo must never do that; drop the group and warn instead.
+    let control_groups: HashMap<String, Vec<ButtonConfig>> = base
+        .control_groups
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(name, buttons)| {
+            if buttons.is_empty() {
+                eprintln!("Ignoring empty control group {name:?}");
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
     let mut media_layer_keys = base.media_layer_keys.unwrap();
     let mut primary_layer_keys = base.primary_layer_keys.unwrap();
     if width >= 2170 {
