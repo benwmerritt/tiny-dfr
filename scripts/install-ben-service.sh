@@ -8,7 +8,13 @@ set -euo pipefail
 #   sudo systemctl enable --now tiny-dfr.service
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-  exec sudo --preserve-env=PATH "$0" "$@"
+  cat >&2 <<EOF
+This installer must run as root because it installs /usr/local/bin and switches system services.
+
+Run it from an interactive terminal with:
+  sudo $0
+EOF
+  exit 1
 fi
 
 repo_root="${TINY_DFR_FORK_DIR:-/home/ben/dev/projects/tiny-dfr}"
@@ -56,10 +62,16 @@ fi
 
 echo "Found Touch Bar DRM device: $touchbar_card"
 
+config_backup=""
+
 rollback_to_stock() {
   echo "Rolling back to stock tiny-dfr.service" >&2
   systemctl disable --now tiny-dfr-ben.service || true
   systemctl reset-failed tiny-dfr-ben.service tiny-dfr.service || true
+  if [[ -n "$config_backup" && -f "$config_backup" ]]; then
+    echo "Restoring previous /etc/tiny-dfr/config.toml from $config_backup" >&2
+    install -o root -g root -m 0644 "$config_backup" /etc/tiny-dfr/config.toml
+  fi
   systemctl enable --now tiny-dfr.service
 }
 
@@ -67,7 +79,8 @@ install -o root -g root -m 0755 "$binary_src" /usr/local/bin/tiny-dfr-ben
 install -d -m 0755 /etc/tiny-dfr
 
 if [[ -e /etc/tiny-dfr/config.toml ]] && ! cmp -s "$config_src" /etc/tiny-dfr/config.toml; then
-  cp -a /etc/tiny-dfr/config.toml "/etc/tiny-dfr/config.toml.bak.$(date +%Y%m%d-%H%M%S)"
+  config_backup="/etc/tiny-dfr/config.toml.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -a /etc/tiny-dfr/config.toml "$config_backup"
 fi
 install -o root -g root -m 0644 "$config_src" /etc/tiny-dfr/config.toml
 
@@ -103,8 +116,17 @@ systemctl reset-failed tiny-dfr-ben.service tiny-dfr.service || true
 
 # tiny-dfr owns the Touch Bar DRM/input/uinput devices, so only one instance
 # should run at a time.
-systemctl stop tiny-dfr.service
-systemctl start tiny-dfr-ben.service
+if ! systemctl stop tiny-dfr.service; then
+  echo "Failed to stop stock tiny-dfr.service; aborting without starting fork." >&2
+  rollback_to_stock
+  exit 1
+fi
+
+if ! systemctl start tiny-dfr-ben.service; then
+  echo "Failed to start tiny-dfr-ben.service." >&2
+  rollback_to_stock
+  exit 1
+fi
 sleep 2
 
 if systemctl is-active --quiet tiny-dfr-ben.service; then
