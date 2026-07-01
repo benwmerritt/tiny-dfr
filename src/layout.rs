@@ -23,23 +23,31 @@ pub(crate) fn strip_region(n_buttons: usize) -> RegionGeometry {
     }
 }
 
-// Right-anchored; never allowed to intrude into [0, min_origin) so the strip
-// stays untouched even under a pathologically wide controls config.
+// Controls region placement. `anchor_x` is the desired (unclamped) origin —
+// the launcher position an overlay expands from; None means right-anchored
+// (the base controls row). Never intrudes into [0, min_origin) so the strip
+// stays untouched even under a pathologically wide controls config; in that
+// degenerate branch the anchor is ignored entirely.
 pub(crate) fn controls_region(
     virtual_count: usize,
     bar_width: i32,
     min_origin: f64,
+    anchor_x: Option<f64>,
 ) -> RegionGeometry {
     let n = virtual_count.max(1) as i32;
     let width = n * CONTROL_UNIT_PX + (n - 1) * CONTROL_SPACING_PX;
-    let origin = bar_width as f64 - CONTROL_RIGHT_MARGIN_PX - width as f64;
-    if origin < min_origin {
+    let max_origin = bar_width as f64 - CONTROL_RIGHT_MARGIN_PX - width as f64;
+    if max_origin < min_origin {
         let clamped_width = (bar_width as f64 - CONTROL_RIGHT_MARGIN_PX - min_origin) as i32;
         return RegionGeometry {
             origin: min_origin,
             width: clamped_width.max(1),
         };
     }
+    let origin = anchor_x
+        .filter(|a| a.is_finite())
+        .map(|a| a.clamp(min_origin, max_origin))
+        .unwrap_or(max_origin);
     RegionGeometry { origin, width }
 }
 
@@ -232,8 +240,8 @@ mod tests {
     }
 
     #[test]
-    fn controls_region_is_right_anchored() {
-        let geo = controls_region(2, 2008, 0.0);
+    fn controls_region_is_right_anchored_without_anchor() {
+        let geo = controls_region(2, 2008, 0.0, None);
 
         let expected_width = 2 * CONTROL_UNIT_PX + CONTROL_SPACING_PX;
         assert_eq!(geo.width, expected_width);
@@ -246,12 +254,49 @@ mod tests {
     #[test]
     fn controls_region_clamps_to_min_origin() {
         let min_origin = 300.0;
-        let geo = controls_region(50, 2008, min_origin);
+        let geo = controls_region(50, 2008, min_origin, None);
 
         assert_eq!(geo.origin, min_origin);
         assert_eq!(
             geo.width,
             (2008.0 - CONTROL_RIGHT_MARGIN_PX - min_origin) as i32
         );
+    }
+
+    #[test]
+    fn anchored_region_sits_at_the_anchor_within_bounds() {
+        let geo = controls_region(2, 2008, 300.0, Some(800.0));
+
+        assert_eq!(geo.origin, 800.0);
+        assert_eq!(geo.width, 2 * CONTROL_UNIT_PX + CONTROL_SPACING_PX);
+    }
+
+    #[test]
+    fn anchor_clamps_to_min_origin_and_right_margin() {
+        let expected_width = 2 * CONTROL_UNIT_PX + CONTROL_SPACING_PX;
+        let max_origin = 2008.0 - CONTROL_RIGHT_MARGIN_PX - expected_width as f64;
+
+        let left = controls_region(2, 2008, 300.0, Some(10.0));
+        assert_eq!(left.origin, 300.0);
+
+        let right = controls_region(2, 2008, 300.0, Some(5000.0));
+        assert_eq!(right.origin, max_origin);
+    }
+
+    #[test]
+    fn anchor_is_ignored_when_region_is_pinned_and_shrunk() {
+        let geo = controls_region(50, 2008, 300.0, Some(700.0));
+
+        assert_eq!(geo.origin, 300.0);
+        assert_eq!(geo.width, (2008.0 - CONTROL_RIGHT_MARGIN_PX - 300.0) as i32);
+    }
+
+    #[test]
+    fn non_finite_anchor_falls_back_to_right_anchored() {
+        let expected_width = 2 * CONTROL_UNIT_PX + CONTROL_SPACING_PX;
+        let max_origin = 2008.0 - CONTROL_RIGHT_MARGIN_PX - expected_width as f64;
+
+        let geo = controls_region(2, 2008, 300.0, Some(f64::NAN));
+        assert_eq!(geo.origin, max_origin);
     }
 }

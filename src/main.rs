@@ -986,15 +986,25 @@ impl ButtonSet {
 // cannot grow the stack without limit.
 const MAX_OVERLAY_DEPTH: usize = 8;
 
+// One open overlay level. `anchor_x` is the UNCLAMPED left edge of the
+// launcher that opened it (folder-expands-in-place); clamping happens at
+// geometry-resolution time so a strip reflow re-clamps automatically. None
+// falls back to right-anchored.
+#[derive(Clone, Debug, PartialEq)]
+struct OverlayFrame {
+    name: String,
+    anchor_x: Option<f64>,
+}
+
 #[derive(Default)]
 pub struct FunctionLayer {
     kind: LayerKind,
     base: ButtonSet,
     overlays: HashMap<String, ButtonSet>,
-    overlay_stack: Vec<String>,
+    overlay_stack: Vec<OverlayFrame>,
     // Last time the open overlay stack was touched or changed; drives the
     // auto-close timeout.
-    overlay_anchor: Option<Instant>,
+    overlay_touched_at: Option<Instant>,
     // Regions only: the pinned workspace strip. Static fallback content until
     // live compositor state arrives over the control socket.
     strip: ButtonSet,
@@ -1047,7 +1057,7 @@ impl FunctionLayer {
             base,
             overlays,
             overlay_stack: Vec::new(),
-            overlay_anchor: None,
+            overlay_touched_at: None,
             strip,
             strip_generation: 0,
         }
@@ -1058,7 +1068,7 @@ impl FunctionLayer {
     fn controls_key(&self) -> ButtonSetKey {
         self.overlay_stack
             .last()
-            .map(|name| ButtonSetKey::Overlay(name.clone()))
+            .map(|frame| ButtonSetKey::Overlay(frame.name.clone()))
             .unwrap_or(ButtonSetKey::Base)
     }
 
@@ -1253,22 +1263,28 @@ impl FunctionLayer {
         }
     }
 
-    fn open_overlay(&mut self, name: &str) -> bool {
+    fn open_overlay(&mut self, name: &str, anchor_x: Option<f64>) -> bool {
         if !self.overlays.contains_key(name)
-            || self.overlay_stack.last().is_some_and(|top| top == name)
+            || self
+                .overlay_stack
+                .last()
+                .is_some_and(|top| top.name == name)
             || self.overlay_stack.len() >= MAX_OVERLAY_DEPTH
         {
             return false;
         }
-        self.overlay_stack.push(name.to_string());
-        self.overlay_anchor = Some(Instant::now());
+        self.overlay_stack.push(OverlayFrame {
+            name: name.to_string(),
+            anchor_x,
+        });
+        self.overlay_touched_at = Some(Instant::now());
         self.mark_visible_set_changed();
         true
     }
 
     fn close_top_overlay(&mut self) -> bool {
         if self.overlay_stack.pop().is_some() {
-            self.overlay_anchor = self.has_open_overlay().then(Instant::now);
+            self.overlay_touched_at = self.has_open_overlay().then(Instant::now);
             self.mark_visible_set_changed();
             true
         } else {
@@ -1281,7 +1297,7 @@ impl FunctionLayer {
             return false;
         }
         self.overlay_stack.clear();
-        self.overlay_anchor = None;
+        self.overlay_touched_at = None;
         self.mark_visible_set_changed();
         true
     }
@@ -1292,7 +1308,7 @@ impl FunctionLayer {
 
     fn mark_overlay_touched(&mut self, now: Instant) {
         if self.has_open_overlay() {
-            self.overlay_anchor = Some(now);
+            self.overlay_touched_at = Some(now);
         }
     }
 
@@ -1300,24 +1316,26 @@ impl FunctionLayer {
         if !self.has_open_overlay() {
             return None;
         }
-        overlay_timeout_remaining_ms(self.overlay_anchor, now, timeout)
+        overlay_timeout_remaining_ms(self.overlay_touched_at, now, timeout)
     }
 
-    fn activate_button_action(&mut self, action: ButtonAction) -> bool {
+    fn activate_button_action(&mut self, action: ButtonAction, anchor_x: Option<f64>) -> bool {
         match action {
-            ButtonAction::OpenOverlay(name) => self.open_overlay(&name),
+            ButtonAction::OpenOverlay(name) => self.open_overlay(&name, anchor_x),
             ButtonAction::CloseOverlay => self.close_top_overlay(),
             // Sliders act during the drag, never on release.
             ButtonAction::Keys(_) | ButtonAction::Slider(_) | ButtonAction::None => false,
         }
     }
 
-    // Geometry of the controls region for a given button set; the region is
-    // right-anchored and never intrudes into the strip.
+    // Geometry of the controls region for a given button set: anchored at
+    // the open overlay's launcher when there is one, right-anchored for the
+    // base row, never intruding into the strip.
     fn controls_geometry(&self, set: &ButtonSet, bar_width: i32) -> RegionGeometry {
         let strip_geo = strip_region(self.strip.buttons.len());
         let min_origin = strip_geo.origin + strip_geo.width as f64 + BUTTON_SPACING_PX as f64;
-        controls_region(set.virtual_button_count, bar_width, min_origin)
+        let anchor_x = self.overlay_stack.last().and_then(|frame| frame.anchor_x);
+        controls_region(set.virtual_button_count, bar_width, min_origin, anchor_x)
     }
 
     fn draw(
@@ -1637,7 +1655,7 @@ mod function_layer_tests {
         );
 
         assert_eq!(layer.hit(100, 20, 75.0, 10.0, None), Some(1));
-        assert!(layer.open_overlay("volume"));
+        assert!(layer.open_overlay("volume", None));
         assert_eq!(layer.hit(100, 20, 75.0, 10.0, None), Some(0));
     }
 
@@ -1657,7 +1675,7 @@ mod function_layer_tests {
             None,
         );
 
-        assert!(layer.open_overlay("volume"));
+        assert!(layer.open_overlay("volume", None));
         assert_eq!(layer.hit(100, 20, 75.0, 10.0, None), Some(0));
         assert!(layer.close_top_overlay());
         assert_eq!(layer.hit(100, 20, 75.0, 10.0, None), Some(1));
@@ -1671,7 +1689,7 @@ mod function_layer_tests {
             None,
         );
 
-        assert!(!layer.activate_button_action(ButtonAction::Keys(vec![Key::F1])));
+        assert!(!layer.activate_button_action(ButtonAction::Keys(vec![Key::F1]), None));
         assert!(layer.overlay_stack.is_empty());
     }
 
@@ -1702,8 +1720,8 @@ mod function_layer_tests {
     fn nested_open_shows_innermost_overlay() {
         let mut layer = nested_layer();
 
-        assert!(layer.open_overlay("sound"));
-        assert!(layer.open_overlay("volume"));
+        assert!(layer.open_overlay("sound", None));
+        assert!(layer.open_overlay("volume", None));
 
         assert_eq!(
             layer.controls_key(),
@@ -1714,8 +1732,8 @@ mod function_layer_tests {
     #[test]
     fn close_all_returns_to_base_from_depth_two() {
         let mut layer = nested_layer();
-        assert!(layer.open_overlay("sound"));
-        assert!(layer.open_overlay("volume"));
+        assert!(layer.open_overlay("sound", None));
+        assert!(layer.open_overlay("volume", None));
 
         assert!(layer.close_all_overlays());
 
@@ -1726,10 +1744,10 @@ mod function_layer_tests {
     #[test]
     fn close_overlay_action_pops_one_level() {
         let mut layer = nested_layer();
-        assert!(layer.open_overlay("sound"));
-        assert!(layer.open_overlay("volume"));
+        assert!(layer.open_overlay("sound", None));
+        assert!(layer.open_overlay("volume", None));
 
-        assert!(layer.activate_button_action(ButtonAction::CloseOverlay));
+        assert!(layer.activate_button_action(ButtonAction::CloseOverlay, None));
 
         assert_eq!(
             layer.controls_key(),
@@ -1740,9 +1758,9 @@ mod function_layer_tests {
     #[test]
     fn reopening_top_overlay_is_a_noop() {
         let mut layer = nested_layer();
-        assert!(layer.open_overlay("sound"));
+        assert!(layer.open_overlay("sound", None));
 
-        assert!(!layer.open_overlay("sound"));
+        assert!(!layer.open_overlay("sound", None));
 
         assert_eq!(layer.overlay_stack.len(), 1);
     }
@@ -1751,8 +1769,8 @@ mod function_layer_tests {
     fn overlay_stack_depth_is_bounded() {
         let mut layer = nested_layer();
         for _ in 0..2 * MAX_OVERLAY_DEPTH {
-            layer.open_overlay("sound");
-            layer.open_overlay("volume");
+            layer.open_overlay("sound", None);
+            layer.open_overlay("volume", None);
         }
 
         assert!(layer.overlay_stack.len() <= MAX_OVERLAY_DEPTH);
@@ -1762,7 +1780,7 @@ mod function_layer_tests {
     fn opening_missing_overlay_is_rejected() {
         let mut layer = nested_layer();
 
-        assert!(!layer.open_overlay("does-not-exist"));
+        assert!(!layer.open_overlay("does-not-exist", None));
 
         assert_eq!(layer.controls_key(), ButtonSetKey::Base);
     }
@@ -1840,7 +1858,7 @@ mod function_layer_tests {
     #[test]
     fn outside_tap_with_overlay_open_is_outside_controls() {
         let mut layer = regions_layer(4);
-        assert!(layer.open_overlay("canary"));
+        assert!(layer.open_overlay("canary", None));
 
         assert!(matches!(
             layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 1000.0, 30.0),
@@ -1850,6 +1868,105 @@ mod function_layer_tests {
         assert!(matches!(
             layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 42.0, 30.0),
             HitOutcome::Button(ButtonSetKey::Strip(0), 0)
+        ));
+    }
+
+    #[test]
+    fn anchored_overlay_hits_at_the_anchor_not_the_right_edge() {
+        let mut layer = regions_layer(4);
+        assert!(layer.open_overlay("canary", Some(800.0)));
+
+        // One 110px button expanding at x=800.
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 850.0, 30.0),
+            HitOutcome::Button(ButtonSetKey::Overlay(_), 0)
+        ));
+        // The old right-anchored slot is now outside the overlay...
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 1890.0, 30.0),
+            HitOutcome::OutsideControls
+        ));
+        // ...and so is the space left of the anchor.
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 700.0, 30.0),
+            HitOutcome::OutsideControls
+        ));
+        // span/hit consistency: the drag-geometry helper agrees.
+        let key = layer.controls_key();
+        let (left, width) = layer.button_span_abs(&key, 0, BAR_WIDTH as i32).unwrap();
+        assert_eq!(left, 800.0);
+        assert_eq!(width, 110.0);
+    }
+
+    #[test]
+    fn anchor_left_of_strip_clamps_to_min_origin() {
+        let mut layer = regions_layer(4);
+        // Strip: 4 buttons ending at 12 + 270 = 282; min_origin = 298.
+        assert!(layer.open_overlay("canary", Some(10.0)));
+
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 300.0, 30.0),
+            HitOutcome::Button(ButtonSetKey::Overlay(_), 0)
+        ));
+    }
+
+    #[test]
+    fn nested_overlay_anchors_at_its_own_launcher() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            "sound".to_string(),
+            vec![
+                text_button("vol", ButtonAction::OpenOverlay("volume".to_string())),
+                text_button("play", ButtonAction::None),
+            ],
+        );
+        groups.insert(
+            "volume".to_string(),
+            vec![text_button("slider", ButtonAction::None)],
+        );
+        let mut layer = FunctionLayer::with_config(
+            vec![text_button(
+                "open",
+                ButtonAction::OpenOverlay("sound".to_string()),
+            )],
+            groups,
+            Some(&ws_cfg(4)),
+        );
+        assert!(layer.open_overlay("sound", Some(900.0)));
+
+        // The "vol" button inside the sound overlay sits at x=900; opening
+        // the nested overlay from it cascades the anchor.
+        let sound_key = layer.controls_key();
+        let (vol_left, _) = layer
+            .button_span_abs(&sound_key, 0, BAR_WIDTH as i32)
+            .unwrap();
+        assert_eq!(vol_left, 900.0);
+        assert!(layer.activate_button_action(
+            ButtonAction::OpenOverlay("volume".to_string()),
+            Some(vol_left)
+        ));
+
+        let volume_key = layer.controls_key();
+        let (slider_left, _) = layer
+            .button_span_abs(&volume_key, 0, BAR_WIDTH as i32)
+            .unwrap();
+        assert_eq!(slider_left, 900.0);
+    }
+
+    #[test]
+    fn base_returns_right_anchored_after_close() {
+        let mut layer = regions_layer(4);
+        assert!(layer.open_overlay("canary", Some(800.0)));
+        assert!(layer.close_all_overlays());
+
+        // Base row (2 buttons, 236px) right-anchored at 2008 - 12 - 236.
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 1765.0, 30.0),
+            HitOutcome::Button(ButtonSetKey::Base, 0)
+        ));
+        assert!(matches!(
+            layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 850.0, 30.0),
+            HitOutcome::Miss
         ));
     }
 
@@ -1905,7 +2022,7 @@ mod function_layer_tests {
     fn touch_refreshes_timeout_anchor() {
         let mut layer = regions_layer(4);
         let timeout = Duration::from_millis(8000);
-        assert!(layer.open_overlay("canary"));
+        assert!(layer.open_overlay("canary", None));
         let t0 = Instant::now();
         layer.mark_overlay_touched(t0);
 
@@ -1921,7 +2038,7 @@ mod function_layer_tests {
     fn timeout_is_inert_without_an_open_overlay() {
         let mut layer = regions_layer(4);
         let timeout = Duration::from_millis(8000);
-        assert!(layer.open_overlay("canary"));
+        assert!(layer.open_overlay("canary", None));
         assert!(layer.close_all_overlays());
 
         assert_eq!(
@@ -2000,9 +2117,9 @@ OpenOverlay = "volume""#,
     #[test]
     fn slider_action_never_changes_overlay_state() {
         let mut layer = nested_layer();
-        assert!(layer.open_overlay("sound"));
+        assert!(layer.open_overlay("sound", None));
 
-        assert!(!layer.activate_button_action(ButtonAction::Slider(SliderTarget::Volume)));
+        assert!(!layer.activate_button_action(ButtonAction::Slider(SliderTarget::Volume), None));
 
         assert_eq!(
             layer.controls_key(),
@@ -2136,7 +2253,7 @@ OpenOverlay = "volume""#,
         let dir = fake_backlight_dir("1000\n", "250\n");
         let missing = std::env::temp_dir().join("tiny-dfr-main-slider-missing");
         let backends = SliderBackends::new(&dir, &missing);
-        assert!(layer.open_overlay("bright"));
+        assert!(layer.open_overlay("bright", None));
 
         layer.sync_sliders(&backends);
 
@@ -2153,7 +2270,7 @@ OpenOverlay = "volume""#,
         let dir = fake_backlight_dir("1000\n", "250\n");
         let missing = std::env::temp_dir().join("tiny-dfr-main-slider-missing");
         let backends = SliderBackends::new(&dir, &missing);
-        assert!(layer.open_overlay("bright"));
+        assert!(layer.open_overlay("bright", None));
         let key = ButtonSetKey::Overlay("bright".to_string());
         layer.update_slider(&key, 0, Some(0.9), true);
 
@@ -2166,7 +2283,7 @@ OpenOverlay = "volume""#,
     #[test]
     fn update_slider_marks_button_changed_on_value_or_phase_change() {
         let mut layer = slider_layer();
-        assert!(layer.open_overlay("bright"));
+        assert!(layer.open_overlay("bright", None));
         let key = ButtonSetKey::Overlay("bright".to_string());
         layer.button_mut_in_set(&key, 0).unwrap().changed = false;
 
@@ -2219,7 +2336,7 @@ OpenOverlay = "volume""#,
             layer.hit_in_set(100, 20, 75.0, 10.0, &base, Some(1)),
             Some(1)
         );
-        assert!(layer.open_overlay("volume"));
+        assert!(layer.open_overlay("volume", None));
 
         assert_eq!(layer.hit(100, 20, 75.0, 10.0, None), Some(0));
         assert_eq!(layer.hit_in_set(100, 20, 75.0, 10.0, &base, Some(1)), None);
@@ -2740,7 +2857,13 @@ fn real_main(drm: &mut DrmBackend) {
                             }
                             if hit && can_activate {
                                 if let Some(action) = action {
-                                    if layers[layer].activate_button_action(action) {
+                                    // The launcher's span, resolved under
+                                    // pre-activation geometry, becomes the
+                                    // anchor the opened overlay expands from.
+                                    let anchor = layers[layer]
+                                        .button_span_abs(&button_set, btn, width as i32)
+                                        .map(|(left, _)| left);
+                                    if layers[layer].activate_button_action(action, anchor) {
                                         drain_touches(&mut layers, &mut touches, &mut uinput);
                                         layers[layer].sync_sliders(&slider_backends);
                                         needs_complete_redraw = true;
