@@ -67,8 +67,10 @@ echo 0 > "$usb_dev/authorized"
 sleep 3
 echo 1 > "$usb_dev/authorized"
 
-# Wait for appletbdrm to rebind so a following service (re)start finds the card.
-for _ in $(seq 1 10); do
+# Wait for appletbdrm to rebind so a following service (re)start finds the
+# card. Re-enumeration has been observed to take ~12-15s on this machine, so
+# be patient before giving up.
+for _ in $(seq 1 20); do
   sleep 1
   for card in /sys/class/drm/card[0-9]*; do
     [[ -e "$card/device/driver" ]] || continue
@@ -79,5 +81,17 @@ for _ in $(seq 1 10); do
   done
 done
 
-echo "Device reset but appletbdrm did not rebind within 10s; a reboot may still be needed." >&2
+# No appletbdrm card came back. The usual cause: the device re-attached in USB
+# configuration 1 (HID-only). The DRM *display* lives in configuration 2, which
+# the kernel selects at boot but not always after a hot re-auth. We must NOT
+# write bConfigurationValue to force it — that force-switch is forbidden on this
+# machine (it can harden the wedge until reboot). A reboot is the safe recovery.
+cfg="$(cat "$usb_dev/bConfigurationValue" 2>/dev/null || echo '?')"
+if [[ "$cfg" != 2 ]]; then
+  echo "Display re-attached in USB config $cfg (no DRM display interface present)." >&2
+  echo "The display mode only returns on reboot; config-switching is forbidden here." >&2
+else
+  echo "Device is in config 2 but appletbdrm did not rebind; reboot to recover." >&2
+fi
+echo "REBOOT to recover. Any already-installed tiny-dfr-ben binary will run on boot." >&2
 exit 1
