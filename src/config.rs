@@ -301,7 +301,13 @@ fn arm_inotify(inotify_fd: &Inotify) -> Option<WatchDescriptor> {
     match inotify_fd.add_watch(USER_CFG_PATH, flags) {
         Ok(wd) => Some(wd),
         Err(Errno::ENOENT) => None,
-        e => Some(e.unwrap()),
+        // Never panic here: re-arming races config deploys (install briefly
+        // leaves the file unreadable to the post-privdrop daemon -> EACCES).
+        // None retries on the next loop iteration.
+        Err(e) => {
+            eprintln!("config watch failed ({e}); retrying on next event");
+            None
+        }
     }
 }
 

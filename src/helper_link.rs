@@ -148,6 +148,7 @@ impl HelperLink {
     fn drop_client(&mut self, epoll: &Epoll) {
         if let Some(client) = self.client.take() {
             let _ = epoll.delete(&client.stream);
+            eprintln!("helper disconnected");
         }
     }
 
@@ -181,6 +182,7 @@ impl HelperLink {
                     {
                         continue;
                     }
+                    eprintln!("helper connected (uid {uid})");
                     self.client = Some(Client::new(stream));
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,

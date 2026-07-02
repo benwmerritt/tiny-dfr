@@ -8,12 +8,17 @@ use std::time::{Duration, Instant};
 // free middle region like a tiny 2D platformer — strictly left/right along
 // the floor, with a little hop in the stride. Render-only: no hit spans, no
 // keys, no intents; they exist only while the helper reports sessions. The
-// animation runs at ~15fps via the event loop's timeout clamp (the
+// animation runs at 10fps via the event loop's timeout clamp (the
 // pixel-shift pattern) and only while critters are visible.
 
-pub const CRITTER_FRAME: Duration = Duration::from_millis(66);
+// 10fps: gentle on the appletbdrm USB display path, which wedged the whole
+// bar (kernel ETIMEDOUT, daemon in D-sleep) under sustained 15fps damage
+// traffic with multiple small rects per frame. Animation now emits exactly
+// ONE union damage rect per frame — the same shape as the proven-safe
+// button redraws.
+pub const CRITTER_FRAME: Duration = Duration::from_millis(100);
 // Bound a tick's dt so a suspend/resume gap doesn't teleport anyone.
-const MAX_TICK_DT: Duration = Duration::from_millis(250);
+const MAX_TICK_DT: Duration = Duration::from_millis(300);
 const WALK_SPEED_MIN: f64 = 25.0; // px/s
 const WALK_SPEED_MAX: f64 = 60.0;
 const TURN_CHANCE_PER_SEC: f64 = 0.25;
@@ -159,39 +164,49 @@ impl CritterField {
         region: Option<(f64, f64)>,
         complete_redraw: bool,
     ) -> Vec<ClipRect> {
-        let mut clips = Vec::new();
+        // All erases and draws merge into ONE damage span per frame, so the
+        // fragile USB display path sees a single well-formed rect.
+        let mut damage: Option<(f64, f64)> = None;
+        let grow = |span: (f64, f64), damage: &mut Option<(f64, f64)>| {
+            *damage = Some(match damage {
+                Some((lo, hi)) => (lo.min(span.0), hi.max(span.1)),
+                None => span,
+            });
+        };
         if !complete_redraw {
             for span in self.prev_spans.drain(..) {
                 c.set_source_rgb(0.0, 0.0, 0.0);
                 c.rectangle(span.0, TOP_Y, span.1 - span.0, BOTTOM_Y - TOP_Y);
                 c.fill().unwrap();
-                clips.push(clip_for_span(span, height, bar_width));
+                grow(span, &mut damage);
             }
         } else {
             self.prev_spans.clear();
         }
 
-        let (Some((start, end)), Some(sprite)) = (region, self.sprite.as_ref()) else {
-            return clips;
-        };
-        let (lo, hi) = (
-            start + HALF_WIDTH,
-            (end - HALF_WIDTH).max(start + HALF_WIDTH),
-        );
-        for critter in &self.critters {
-            let x = critter.x.clamp(lo, hi);
-            // Platformer stride: the sprite bounces off the floor.
-            let hop = critter.phase.sin().abs() * HOP_HEIGHT;
-            let rect_y = FLOOR_Y - hop - GLYPH_BOTTOM / VIEWBOX * RECT_SIZE;
-            let _ = sprite.render_document(
-                c,
-                &Rectangle::new(x - RECT_SIZE / 2.0, rect_y, RECT_SIZE, RECT_SIZE),
+        if let (Some((start, end)), Some(sprite)) = (region, self.sprite.as_ref()) {
+            let (lo, hi) = (
+                start + HALF_WIDTH,
+                (end - HALF_WIDTH).max(start + HALF_WIDTH),
             );
-            let span = (x - HALF_WIDTH, x + HALF_WIDTH);
-            clips.push(clip_for_span(span, height, bar_width));
-            self.prev_spans.push(span);
+            for critter in &self.critters {
+                let x = critter.x.clamp(lo, hi);
+                // Platformer stride: the sprite bounces off the floor.
+                let hop = critter.phase.sin().abs() * HOP_HEIGHT;
+                let rect_y = FLOOR_Y - hop - GLYPH_BOTTOM / VIEWBOX * RECT_SIZE;
+                let _ = sprite.render_document(
+                    c,
+                    &Rectangle::new(x - RECT_SIZE / 2.0, rect_y, RECT_SIZE, RECT_SIZE),
+                );
+                let span = (x - HALF_WIDTH, x + HALF_WIDTH);
+                grow(span, &mut damage);
+                self.prev_spans.push(span);
+            }
         }
-        clips
+        damage
+            .and_then(|span| clip_for_span(span, height, bar_width))
+            .into_iter()
+            .collect()
     }
 }
 
@@ -205,16 +220,21 @@ impl Default for CritterField {
 const TOP_Y: f64 = 6.0;
 const BOTTOM_Y: f64 = 59.0;
 
-fn clip_for_span(span: (f64, f64), height: i32, bar_width: i32) -> ClipRect {
+// None when the span degenerates (fully off-bar): the display driver must
+// never see a zero-area or inverted rect.
+fn clip_for_span(span: (f64, f64), height: i32, bar_width: i32) -> Option<ClipRect> {
     let x1 = span.0.floor().clamp(0.0, bar_width as f64) as u16;
     let x2 = span.1.ceil().clamp(0.0, bar_width as f64) as u16;
+    if x2 <= x1 {
+        return None;
+    }
     // Same fb mapping as draw_button_set: fb x = height - drawing y.
-    ClipRect::new(
+    Some(ClipRect::new(
         (height as f64 - BOTTOM_Y).max(0.0) as u16,
         x1,
         (height as f64 - TOP_Y) as u16,
         x2,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -262,7 +282,7 @@ mod tests {
 
         assert!(field.tick(t0, REGION)); // first frame
         assert!(!field.tick(t0 + Duration::from_millis(10), REGION)); // too soon
-        assert!(field.tick(t0 + Duration::from_millis(80), REGION));
+        assert!(field.tick(t0 + CRITTER_FRAME + Duration::from_millis(10), REGION));
 
         // A long walk never escapes the region, even across a fake suspend.
         let mut now = t0 + Duration::from_millis(80);
@@ -288,13 +308,19 @@ mod tests {
         assert_eq!(first.len(), 1); // draw only; complete redraw skips erase
         assert!(field.needs_erase());
 
+        // Erase + draw merge into a single union damage rect: the USB
+        // display path only ever sees one well-formed rect per frame.
         let second = field.render(&c, 60, 2008, Some(REGION), false);
-        assert_eq!(second.len(), 2); // erase old + draw new
+        assert_eq!(second.len(), 1);
 
         // Deactivation (no region) erases and reports that damage.
         let third = field.render(&c, 60, 2008, None, false);
         assert_eq!(third.len(), 1);
         assert!(!field.needs_erase());
+
+        // Nothing to erase and nothing to draw = zero rects.
+        let fourth = field.render(&c, 60, 2008, None, false);
+        assert!(fourth.is_empty());
     }
 
     #[test]
