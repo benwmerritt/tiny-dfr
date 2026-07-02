@@ -3103,19 +3103,23 @@ fn real_main(drm: &mut DrmBackend) {
                 });
                 let volume = fresh.then(|| link.state().vol).flatten().map(|v| v.level);
                 // Pet-Claude census: one critter per session while fresh.
-                let session_ids: Vec<String> = if fresh {
-                    link.state()
-                        .claude
-                        .as_ref()
-                        .map(|c| c.sessions.iter().map(|s| s.id.clone()).collect())
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                let spawn_region = layers[active_layer]
-                    .free_region(width as i32)
-                    .unwrap_or((300.0, (width as f64 - 300.0).max(400.0)));
-                critter_field.reconcile(&session_ids, spawn_region);
+                // Parked behind EnableCritters (default off) — the animation
+                // wedges the USB display; see .scratch/claude-critter/.
+                if cfg.enable_critters {
+                    let session_ids: Vec<String> = if fresh {
+                        link.state()
+                            .claude
+                            .as_ref()
+                            .map(|c| c.sessions.iter().map(|s| s.id.clone()).collect())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let spawn_region = layers[active_layer]
+                        .free_region(width as i32)
+                        .unwrap_or((300.0, (width as f64 - 300.0).max(400.0)));
+                    critter_field.reconcile(&session_ids, spawn_region);
+                }
                 for layer in layers.iter_mut() {
                     layer.sync_sliders(&slider_backends, volume);
                 }
@@ -3171,8 +3175,10 @@ fn real_main(drm: &mut DrmBackend) {
         // region exists (Regions layer active), sessions are running, and
         // the bar is lit. Frames ride the epoll timeout like pixel shift.
         let critter_region = layers[active_layer].free_region(width as i32);
-        let critters_visible =
-            critter_region.is_some() && !critter_field.is_empty() && backlight.current_bl() > 0;
+        let critters_visible = cfg.enable_critters
+            && critter_region.is_some()
+            && !critter_field.is_empty()
+            && backlight.current_bl() > 0;
         let mut critters_dirty = false;
         if critters_visible {
             let region = critter_region.unwrap();
@@ -3186,7 +3192,10 @@ fn real_main(drm: &mut DrmBackend) {
         }
 
         let layer_dirty = needs_complete_redraw || layers[active_layer].any_button_changed();
-        if layer_dirty || critters_dirty || (!critters_visible && critter_field.needs_erase()) {
+        if layer_dirty
+            || critters_dirty
+            || (cfg.enable_critters && !critters_visible && critter_field.needs_erase())
+        {
             let shift = if cfg.enable_pixel_shift {
                 pixel_shift.get()
             } else {
@@ -3206,8 +3215,9 @@ fn real_main(drm: &mut DrmBackend) {
                 Vec::new()
             };
             // Critters paint after the layer so they sit on the (empty)
-            // middle; render also erases last frame's spans.
-            {
+            // middle; render also erases last frame's spans. Gated off by
+            // default (EnableCritters) — see .scratch/claude-critter/.
+            if cfg.enable_critters {
                 let c = Context::new(&surface).unwrap();
                 c.translate(height as f64, 0.0);
                 c.rotate((90.0f64).to_radians());

@@ -58,12 +58,14 @@ The complete original project goal plus the field revisions:
 
 ## Known items / next
 
-- **Phase D (next): pet Claude critters** — one animated critter in the
-  free middle region per running Claude Code session (incl. tmux/ssh).
-  Design: `.scratch/claude-critter/idea.md`. Presence rides the state
-  message's must-ignore seam (`"claude":{"sessions":[...]}`); daemon needs
-  an animation tick (pixel-shift timeout pattern) + sprite rendering;
-  render-only invariant applies.
+- **Phase D: pet Claude critters — PARKED (2026-07-03).** Built and complete,
+  but disabled by default behind the `EnableCritters` config flag: the
+  animation's `dirty()` traffic wedges the appletbdrm USB display, and the
+  10fps/merged-damage fix was not enough. All code stays in the tree
+  (`src/critters.rs`, the `claude` protocol types, gated wiring in
+  `src/main.rs`, the sprite, the helper /proc scan). Full context, why it's
+  parked, how to re-enable, and the display-throughput problem to solve first:
+  `.scratch/claude-critter/parked-state.md` (design: `idea.md`).
 - Fn layer is dead on this machine (keyd grabs the keyboard and cannot
   emit KEY_FN) — logged in `.scratch/fn-layer-keyd/issue.md`, Ben chose to
   ignore.
