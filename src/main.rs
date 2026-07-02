@@ -47,6 +47,9 @@ mod display;
 mod fonts;
 mod layout;
 mod pixel_shift;
+// Consumed by the helper socket link as it lands; allow until fully wired.
+#[allow(dead_code)]
+mod helper_proto;
 mod sliders;
 
 use crate::config::ConfigManager;
