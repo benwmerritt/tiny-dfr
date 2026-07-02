@@ -15,11 +15,76 @@ pub(crate) struct RegionGeometry {
     pub(crate) width: i32,
 }
 
-pub(crate) fn strip_region(n_buttons: usize) -> RegionGeometry {
-    let n = n_buttons.max(1) as i32;
-    RegionGeometry {
-        origin: STRIP_LEFT_MARGIN_PX,
-        width: n * STRIP_BUTTON_WIDTH_PX + (n - 1) * STRIP_SPACING_PX,
+pub(crate) const STRIP_GROUP_GAP_PX: i32 = 20;
+
+// The workspace strip laid out as per-output groups: 60px squares with 10px
+// intra-group spacing and a 20px inter-group gap holding a thin divider.
+// Spans carry ABSOLUTE left edges (flat index across groups); the dividers
+// are non-interactive by construction — no span covers the gaps.
+pub(crate) struct StripLayout {
+    pub(crate) region: RegionGeometry,
+    pub(crate) spans: Vec<ButtonSpan>,
+    pub(crate) divider_xs: Vec<f64>,
+}
+
+pub(crate) fn strip_layout(group_sizes: &[usize], x_offset: f64) -> StripLayout {
+    let origin = STRIP_LEFT_MARGIN_PX + x_offset;
+    let mut spans = Vec::new();
+    let mut divider_xs = Vec::new();
+    let mut x = origin;
+    let mut index = 0;
+    let mut first_group = true;
+    for &size in group_sizes.iter().filter(|&&size| size > 0) {
+        if !first_group {
+            divider_xs.push(x + STRIP_GROUP_GAP_PX as f64 / 2.0);
+            x += STRIP_GROUP_GAP_PX as f64;
+        }
+        first_group = false;
+        for i in 0..size {
+            if i > 0 {
+                x += STRIP_SPACING_PX as f64;
+            }
+            spans.push(ButtonSpan {
+                index,
+                virtual_start: index,
+                virtual_end: index + 1,
+                left_edge: x,
+                width: STRIP_BUTTON_WIDTH_PX as f64,
+            });
+            x += STRIP_BUTTON_WIDTH_PX as f64;
+            index += 1;
+        }
+    }
+    let width = ((x - origin) as i32).max(STRIP_BUTTON_WIDTH_PX);
+    StripLayout {
+        region: RegionGeometry { origin, width },
+        spans,
+        divider_xs,
+    }
+}
+
+// Hit-test against absolute spans (the strip's coordinate convention).
+pub(crate) fn hit_in_spans(
+    spans: &[ButtonSpan],
+    total_height: u16,
+    x: f64,
+    y: f64,
+    constrained_index: Option<usize>,
+) -> Option<usize> {
+    if y < 0.1 * total_height as f64 || y > 0.9 * total_height as f64 {
+        return None;
+    }
+    let inside = |span: &ButtonSpan| x >= span.left_edge && x <= span.left_edge + span.width;
+    match constrained_index {
+        Some(index) => spans
+            .iter()
+            .find(|span| span.index == index)
+            .filter(|span| inside(span))
+            .map(|span| span.index),
+        None => spans
+            .iter()
+            .find(|span| inside(span))
+            .map(|span| span.index),
     }
 }
 
@@ -229,14 +294,62 @@ mod tests {
     }
 
     #[test]
-    fn strip_region_width_scales_with_button_count() {
-        let one = strip_region(1);
-        let four = strip_region(4);
+    fn single_group_strip_layout_matches_legacy_geometry() {
+        let layout = strip_layout(&[4], 0.0);
 
-        assert_eq!(one.origin, STRIP_LEFT_MARGIN_PX);
-        assert_eq!(one.width, STRIP_BUTTON_WIDTH_PX);
-        assert_eq!(four.origin, STRIP_LEFT_MARGIN_PX);
-        assert_eq!(four.width, 4 * STRIP_BUTTON_WIDTH_PX + 3 * STRIP_SPACING_PX);
+        assert_eq!(layout.region.origin, STRIP_LEFT_MARGIN_PX);
+        assert_eq!(
+            layout.region.width,
+            4 * STRIP_BUTTON_WIDTH_PX + 3 * STRIP_SPACING_PX
+        );
+        assert!(layout.divider_xs.is_empty());
+        let lefts: Vec<f64> = layout.spans.iter().map(|s| s.left_edge).collect();
+        assert_eq!(lefts, vec![12.0, 82.0, 152.0, 222.0]);
+        assert!(layout.spans.iter().all(|s| s.width == 60.0));
+    }
+
+    #[test]
+    fn grouped_strip_layout_places_dividers_between_groups() {
+        let layout = strip_layout(&[2, 3], 0.0);
+
+        // Group 1: 12..72, 82..142; gap 142..162 (divider at 152);
+        // group 2: 162..222, 232..292, 302..362.
+        let lefts: Vec<f64> = layout.spans.iter().map(|s| s.left_edge).collect();
+        assert_eq!(lefts, vec![12.0, 82.0, 162.0, 232.0, 302.0]);
+        assert_eq!(layout.divider_xs, vec![152.0]);
+        assert_eq!(layout.region.width, 350);
+        // Flat indices run across groups.
+        assert_eq!(
+            layout.spans.iter().map(|s| s.index).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn empty_groups_are_skipped_without_dividers() {
+        let layout = strip_layout(&[0, 3, 0], 0.0);
+
+        assert_eq!(layout.spans.len(), 3);
+        assert!(layout.divider_xs.is_empty());
+    }
+
+    #[test]
+    fn hit_in_spans_hits_buttons_and_misses_gaps() {
+        let layout = strip_layout(&[2, 3], 0.0);
+
+        assert_eq!(hit_in_spans(&layout.spans, 60, 42.0, 30.0, None), Some(0));
+        assert_eq!(hit_in_spans(&layout.spans, 60, 200.0, 30.0, None), Some(2));
+        // Intra-group gap (72..82) and the divider gap (142..162) both miss.
+        assert_eq!(hit_in_spans(&layout.spans, 60, 76.0, 30.0, None), None);
+        assert_eq!(hit_in_spans(&layout.spans, 60, 152.0, 30.0, None), None);
+        // Vertical bounds respected.
+        assert_eq!(hit_in_spans(&layout.spans, 60, 42.0, 2.0, None), None);
+        // Constrained re-hit only checks the original span.
+        assert_eq!(hit_in_spans(&layout.spans, 60, 42.0, 30.0, Some(1)), None);
+        assert_eq!(
+            hit_in_spans(&layout.spans, 60, 100.0, 30.0, Some(1)),
+            Some(1)
+        );
     }
 
     #[test]

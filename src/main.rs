@@ -59,8 +59,8 @@ use backlight::BacklightManager;
 use config::{ButtonConfig, Config, SliderTarget, WorkspacesCfg};
 use display::DrmBackend;
 use layout::{
-    button_spans, controls_region, hit_index, strip_region, ButtonSpan, LayoutSpec, RegionGeometry,
-    CONTROL_SPACING_PX as BUTTON_SPACING_PX, STRIP_SPACING_PX,
+    button_spans, controls_region, hit_in_spans, hit_index, strip_layout, ButtonSpan, LayoutSpec,
+    RegionGeometry, CONTROL_SPACING_PX as BUTTON_SPACING_PX,
 };
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 use sliders::SliderBackends;
@@ -1011,8 +1011,11 @@ pub struct FunctionLayer {
     // auto-close timeout.
     overlay_touched_at: Option<Instant>,
     // Regions only: the pinned workspace strip. Static fallback content until
-    // live compositor state arrives over the control socket.
+    // live compositor state arrives over the control socket. strip_groups
+    // holds the per-output button counts driving the grouped layout (one
+    // group while on fallback content).
     strip: ButtonSet,
+    strip_groups: Vec<usize>,
     strip_generation: u64,
 }
 
@@ -1053,9 +1056,13 @@ impl FunctionLayer {
             .into_iter()
             .map(|(name, cfg)| (name, ButtonSet::with_config(cfg)))
             .collect();
-        let (kind, strip) = match workspaces {
-            Some(ws) => (LayerKind::Regions, fallback_strip_set(ws)),
-            None => (LayerKind::Classic, ButtonSet::default()),
+        let (kind, strip, strip_groups) = match workspaces {
+            Some(ws) => (
+                LayerKind::Regions,
+                fallback_strip_set(ws),
+                vec![ws.fallback_buttons],
+            ),
+            None => (LayerKind::Classic, ButtonSet::default(), Vec::new()),
         };
         FunctionLayer {
             kind,
@@ -1064,6 +1071,7 @@ impl FunctionLayer {
             overlay_stack: Vec::new(),
             overlay_touched_at: None,
             strip,
+            strip_groups,
             strip_generation: 0,
         }
     }
@@ -1199,17 +1207,23 @@ impl FunctionLayer {
         bar_width: i32,
     ) -> Option<(f64, f64)> {
         let button_set = self.button_set(key)?;
+        if matches!(
+            (self.kind, key),
+            (LayerKind::Regions, ButtonSetKey::Strip(_))
+        ) {
+            return strip_layout(&self.strip_groups, 0.0)
+                .spans
+                .into_iter()
+                .find(|span| span.index == index)
+                .map(|span| (span.left_edge, span.width));
+        }
         let button_starts = button_set.button_starts();
-        let (total_width, spacing_px, origin) = match (self.kind, key) {
-            (LayerKind::Regions, ButtonSetKey::Strip(_)) => {
-                let geo = strip_region(button_set.buttons.len());
-                (geo.width, STRIP_SPACING_PX, geo.origin)
-            }
-            (LayerKind::Regions, _) => {
+        let (total_width, spacing_px, origin) = match self.kind {
+            LayerKind::Regions => {
                 let geo = self.controls_geometry(button_set, bar_width);
                 (geo.width, BUTTON_SPACING_PX, geo.origin)
             }
-            (LayerKind::Classic, _) => (bar_width, BUTTON_SPACING_PX, 0.0),
+            LayerKind::Classic => (bar_width, BUTTON_SPACING_PX, 0.0),
         };
         button_spans(LayoutSpec {
             button_starts: &button_starts,
@@ -1337,7 +1351,7 @@ impl FunctionLayer {
     // the open overlay's launcher when there is one, right-anchored for the
     // base row, never intruding into the strip.
     fn controls_geometry(&self, set: &ButtonSet, bar_width: i32) -> RegionGeometry {
-        let strip_geo = strip_region(self.strip.buttons.len());
+        let strip_geo = strip_layout(&self.strip_groups, 0.0).region;
         let min_origin = strip_geo.origin + strip_geo.width as f64 + BUTTON_SPACING_PX as f64;
         let anchor_x = self.overlay_stack.last().and_then(|frame| frame.anchor_x);
         controls_region(set.virtual_button_count, bar_width, min_origin, anchor_x)
@@ -1399,25 +1413,33 @@ impl FunctionLayer {
                 );
             }
             LayerKind::Regions => {
-                let strip_geo = strip_region(self.strip.buttons.len());
-                let strip_starts = self.strip.button_starts();
-                let strip_spans = button_spans(LayoutSpec {
-                    button_starts: &strip_starts,
-                    virtual_button_count: self.strip.virtual_button_count,
-                    total_width: strip_geo.width,
-                    spacing_px: STRIP_SPACING_PX,
-                    x_offset: strip_geo.origin + x_offset,
-                });
+                let strip = strip_layout(&self.strip_groups, x_offset);
                 draw_button_set(
                     &c,
                     &mut self.strip,
-                    &strip_spans,
+                    &strip.spans,
                     config,
                     height,
                     complete_redraw,
                     pixel_shift_y,
                     &mut modified_regions,
                 );
+                // Output-group dividers: thin non-interactive lines centered
+                // in the inter-group gaps. Rebuilds always force a complete
+                // redraw, so drawing them only here keeps damage tracking
+                // simple.
+                if complete_redraw {
+                    c.set_source_rgb(0.35, 0.35, 0.35);
+                    for divider_x in &strip.divider_xs {
+                        c.rectangle(
+                            divider_x - 1.0,
+                            height as f64 * 0.3,
+                            2.0,
+                            height as f64 * 0.4,
+                        );
+                        c.fill().unwrap();
+                    }
+                }
 
                 let controls_geo = self.controls_geometry(self.visible(), effective_width);
                 let controls = self.visible_mut();
@@ -1458,20 +1480,30 @@ impl FunctionLayer {
             return None;
         }
         let button_set = self.button_set(key)?;
+        // The strip hit-tests against its grouped absolute spans (gaps and
+        // dividers have no span and therefore miss by construction).
+        if matches!(
+            (self.kind, key),
+            (LayerKind::Regions, ButtonSetKey::Strip(_))
+        ) {
+            return hit_in_spans(
+                &strip_layout(&self.strip_groups, 0.0).spans,
+                height,
+                x,
+                y,
+                i,
+            );
+        }
         let button_starts = button_set.button_starts();
-        // Regions hit-test in region-local coordinates; a tap left of the
+        // Controls hit-test in region-local coordinates; a tap left of the
         // region maps to a negative x_rel, which hit_index rejects on the
         // span bounds check.
-        let (total_width, spacing_px, x_rel) = match (self.kind, key) {
-            (LayerKind::Regions, ButtonSetKey::Strip(_)) => {
-                let geo = strip_region(button_set.buttons.len());
-                (geo.width, STRIP_SPACING_PX, x - geo.origin)
-            }
-            (LayerKind::Regions, _) => {
+        let (total_width, spacing_px, x_rel) = match self.kind {
+            LayerKind::Regions => {
                 let geo = self.controls_geometry(button_set, width as i32);
                 (geo.width, BUTTON_SPACING_PX, x - geo.origin)
             }
-            (LayerKind::Classic, _) => (width as i32, BUTTON_SPACING_PX, x),
+            LayerKind::Classic => (width as i32, BUTTON_SPACING_PX, x),
         };
         hit_index(
             LayoutSpec {
