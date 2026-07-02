@@ -1,33 +1,47 @@
 use cairo::Context;
 use drm::control::ClipRect;
+use librsvg_rebind::{prelude::HandleExt, Handle, Rectangle};
 use rand::Rng;
 use std::time::{Duration, Instant};
 
-// Pet Claudes: one critter wandering the bar's free middle region per
-// running Claude Code session. Strictly render-only — critters have no hit
-// spans, never emit keys/intents, and only exist while the helper reports
-// sessions. The animation runs at ~15fps via the event loop's timeout clamp
-// (the pixel-shift pattern) and only while critters are visible.
+// Pet Claudes: one Claude Code sprite per running session, walking the bar's
+// free middle region like a tiny 2D platformer — strictly left/right along
+// the floor, with a little hop in the stride. Render-only: no hit spans, no
+// keys, no intents; they exist only while the helper reports sessions. The
+// animation runs at ~15fps via the event loop's timeout clamp (the
+// pixel-shift pattern) and only while critters are visible.
 
 pub const CRITTER_FRAME: Duration = Duration::from_millis(66);
 // Bound a tick's dt so a suspend/resume gap doesn't teleport anyone.
 const MAX_TICK_DT: Duration = Duration::from_millis(250);
-const HALF_WIDTH: f64 = 18.0;
-const WALK_SPEED_MIN: f64 = 14.0; // px/s
-const WALK_SPEED_MAX: f64 = 40.0;
-const TURN_CHANCE_PER_SEC: f64 = 0.3;
-// Claude terracotta.
-const BODY_RGB: (f64, f64, f64) = (0.85, 0.47, 0.34);
+const WALK_SPEED_MIN: f64 = 25.0; // px/s
+const WALK_SPEED_MAX: f64 = 60.0;
+const TURN_CHANCE_PER_SEC: f64 = 0.25;
+const HOP_HEIGHT: f64 = 4.0;
+
+// The embedded Claude Code glyph (lobehub icon, recolored terracotta) fills
+// the x-range of its 24-unit viewBox but only y 5..20. Scale the render rect
+// so the VISIBLE sprite stands ~46px tall (~77% of the 60px bar) with its
+// feet on the floor at y=58.
+const VIEWBOX: f64 = 24.0;
+const GLYPH_TOP: f64 = 5.0;
+const GLYPH_BOTTOM: f64 = 20.0;
+const SPRITE_HEIGHT: f64 = 46.0;
+const FLOOR_Y: f64 = 58.0;
+const RECT_SIZE: f64 = SPRITE_HEIGHT * VIEWBOX / (GLYPH_BOTTOM - GLYPH_TOP);
+const HALF_WIDTH: f64 = RECT_SIZE / 2.0 + 1.0;
+
+pub const CLAUDE_CRITTER_SVG: &[u8] = include_bytes!("../share/tiny-dfr/claude-critter.svg");
 
 struct Critter {
     id: String,
     x: f64,
     vx: f64,
-    phase: f64, // walk cycle, radians-ish accumulator
+    phase: f64, // stride cycle accumulator
 }
 
-#[derive(Default)]
 pub struct CritterField {
+    sprite: Option<Handle>,
     critters: Vec<Critter>,
     // Horizontal spans drawn last frame, pending erasure.
     prev_spans: Vec<(f64, f64)>,
@@ -35,8 +49,24 @@ pub struct CritterField {
 }
 
 impl CritterField {
+    pub fn new() -> CritterField {
+        let sprite = match Handle::from_data(CLAUDE_CRITTER_SVG) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                eprintln!("claude critter sprite failed to load: {e}");
+                None
+            }
+        };
+        CritterField {
+            sprite,
+            critters: Vec::new(),
+            prev_spans: Vec::new(),
+            last_tick: None,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.critters.is_empty()
+        self.critters.is_empty() || self.sprite.is_none()
     }
 
     pub fn needs_erase(&self) -> bool {
@@ -68,6 +98,7 @@ impl CritterField {
     }
 
     // Advance the walk if a frame has elapsed; true = positions moved.
+    // Motion is strictly horizontal; the floor is the floor.
     pub fn tick(&mut self, now: Instant, region: (f64, f64)) -> bool {
         if self.critters.is_empty() {
             self.last_tick = None;
@@ -100,7 +131,8 @@ impl CritterField {
             } else if rng.gen_bool((TURN_CHANCE_PER_SEC * dt).clamp(0.0, 1.0)) {
                 critter.vx = -critter.vx;
             }
-            critter.phase += dt * (3.0 + critter.vx.abs() * 0.15);
+            // Stride cadence scales with speed so faster claudes hop faster.
+            critter.phase += dt * (4.0 + critter.vx.abs() * 0.12);
         }
         true
     }
@@ -139,7 +171,7 @@ impl CritterField {
             self.prev_spans.clear();
         }
 
-        let Some((start, end)) = region else {
+        let (Some((start, end)), Some(sprite)) = (region, self.sprite.as_ref()) else {
             return clips;
         };
         let (lo, hi) = (
@@ -148,7 +180,13 @@ impl CritterField {
         );
         for critter in &self.critters {
             let x = critter.x.clamp(lo, hi);
-            draw_critter(c, x, critter.vx.signum(), critter.phase);
+            // Platformer stride: the sprite bounces off the floor.
+            let hop = critter.phase.sin().abs() * HOP_HEIGHT;
+            let rect_y = FLOOR_Y - hop - GLYPH_BOTTOM / VIEWBOX * RECT_SIZE;
+            let _ = sprite.render_document(
+                c,
+                &Rectangle::new(x - RECT_SIZE / 2.0, rect_y, RECT_SIZE, RECT_SIZE),
+            );
             let span = (x - HALF_WIDTH, x + HALF_WIDTH);
             clips.push(clip_for_span(span, height, bar_width));
             self.prev_spans.push(span);
@@ -157,9 +195,15 @@ impl CritterField {
     }
 }
 
-// Vertical extent of the critter sprite in rotated drawing space.
-const TOP_Y: f64 = 24.0;
-const BOTTOM_Y: f64 = 54.0;
+impl Default for CritterField {
+    fn default() -> CritterField {
+        CritterField::new()
+    }
+}
+
+// Vertical extent of the sprite (incl. hop headroom) in drawing space.
+const TOP_Y: f64 = 6.0;
+const BOTTOM_Y: f64 = 59.0;
 
 fn clip_for_span(span: (f64, f64), height: i32, bar_width: i32) -> ClipRect {
     let x1 = span.0.floor().clamp(0.0, bar_width as f64) as u16;
@@ -171,60 +215,6 @@ fn clip_for_span(span: (f64, f64), height: i32, bar_width: i32) -> ClipRect {
         (height as f64 - TOP_Y) as u16,
         x2,
     )
-}
-
-// A small terracotta blob with eyes, legs, and an antenna, mid-stride.
-fn draw_critter(c: &Context, x: f64, facing: f64, phase: f64) {
-    let bob = (phase * 2.0).sin() * 1.2;
-    let body_cy = 40.0 + bob;
-    let leg_swing = phase.sin() * 3.5;
-
-    // Legs first so the body overlaps their tops.
-    c.set_source_rgb(BODY_RGB.0 * 0.8, BODY_RGB.1 * 0.8, BODY_RGB.2 * 0.8);
-    c.set_line_width(2.4);
-    c.move_to(x - 4.0, body_cy + 5.0);
-    c.line_to(x - 4.0 + leg_swing, 51.0);
-    c.move_to(x + 4.0, body_cy + 5.0);
-    c.line_to(x + 4.0 - leg_swing, 51.0);
-    c.stroke().unwrap();
-
-    // Antenna.
-    c.move_to(x, body_cy - 7.5);
-    c.line_to(x + facing * 2.5, body_cy - 12.0);
-    c.stroke().unwrap();
-    c.new_sub_path();
-    c.arc(
-        x + facing * 2.5,
-        body_cy - 13.0,
-        1.6,
-        0.0,
-        std::f64::consts::TAU,
-    );
-    c.fill().unwrap();
-
-    // Body.
-    c.set_source_rgb(BODY_RGB.0, BODY_RGB.1, BODY_RGB.2);
-    c.save().unwrap();
-    c.translate(x, body_cy);
-    c.scale(11.0, 8.5);
-    c.new_sub_path();
-    c.arc(0.0, 0.0, 1.0, 0.0, std::f64::consts::TAU);
-    c.restore().unwrap();
-    c.fill().unwrap();
-
-    // Eyes, looking where it walks.
-    for side in [-1.0, 1.0f64] {
-        let ex = x + facing * 3.0 + side * 3.4;
-        let ey = body_cy - 2.5;
-        c.set_source_rgb(1.0, 1.0, 1.0);
-        c.new_sub_path();
-        c.arc(ex, ey, 2.4, 0.0, std::f64::consts::TAU);
-        c.fill().unwrap();
-        c.set_source_rgb(0.1, 0.1, 0.1);
-        c.new_sub_path();
-        c.arc(ex + facing * 0.9, ey, 1.1, 0.0, std::f64::consts::TAU);
-        c.fill().unwrap();
-    }
 }
 
 #[cfg(test)]
@@ -239,8 +229,14 @@ mod tests {
     }
 
     #[test]
+    fn embedded_sprite_loads() {
+        let field = CritterField::new();
+        assert!(field.sprite.is_some());
+    }
+
+    #[test]
     fn reconcile_spawns_within_region_and_despawns() {
-        let mut field = CritterField::default();
+        let mut field = CritterField::new();
 
         assert!(field.reconcile(&ids(&["a", "b"]), REGION));
         assert_eq!(field.critters.len(), 2);
@@ -260,7 +256,7 @@ mod tests {
 
     #[test]
     fn tick_paces_frames_and_stays_in_bounds() {
-        let mut field = CritterField::default();
+        let mut field = CritterField::new();
         field.reconcile(&ids(&["a"]), REGION);
         let t0 = Instant::now();
 
@@ -285,7 +281,7 @@ mod tests {
         let c = Context::new(&surface).unwrap();
         c.translate(60.0, 0.0);
         c.rotate((90.0f64).to_radians());
-        let mut field = CritterField::default();
+        let mut field = CritterField::new();
         field.reconcile(&ids(&["a"]), REGION);
 
         let first = field.render(&c, 60, 2008, Some(REGION), true);
@@ -303,7 +299,7 @@ mod tests {
 
     #[test]
     fn wait_ms_is_bounded_by_the_frame_interval() {
-        let mut field = CritterField::default();
+        let mut field = CritterField::new();
         assert_eq!(field.wait_ms(Instant::now()), None);
 
         field.reconcile(&ids(&["a"]), REGION);
