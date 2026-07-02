@@ -105,6 +105,11 @@ Wants=dev-tiny_dfr_backlight.device dev-tiny_dfr_display_backlight.device
 ExecStart=/usr/local/bin/tiny-dfr-ben
 Restart=always
 
+# Hosts the helper socket (chowned to the helper uid, mode 0600, bound
+# pre-privdrop). RuntimeDirectory is exempt from ProtectSystem=strict.
+RuntimeDirectory=tiny-dfr-ben
+RuntimeDirectoryMode=0755
+
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
