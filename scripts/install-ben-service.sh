@@ -102,10 +102,19 @@ cat >/etc/systemd/system/tiny-dfr-ben.service <<'EOF'
 Description=Tiny Apple T2 Mac Touch Bar daemon (Ben fork)
 After=graphical.target systemd-logind.service dev-tiny_dfr_backlight.device dev-tiny_dfr_display_backlight.device
 Wants=dev-tiny_dfr_backlight.device dev-tiny_dfr_display_backlight.device
+# At boot the compositor (niri) briefly holds DRM master on every card,
+# including the appletbdrm Touch Bar, so the daemon's first starts fail with
+# "Device or resource busy" and panic. Disable the start-rate limit so it
+# never gives up; RestartSec below paces the retries until niri releases the
+# card (a few seconds into the session).
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/local/bin/tiny-dfr-ben
 Restart=always
+# 2s between retries: slow enough not to spin the CPU or spam the journal
+# while waiting for the touchbar DRM card, fast enough to come up promptly.
+RestartSec=2
 
 # Hosts the helper socket (chowned to the helper uid, mode 0600, bound
 # pre-privdrop). RuntimeDirectory is exempt from ProtectSystem=strict.
