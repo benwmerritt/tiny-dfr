@@ -10,6 +10,8 @@ pub const MAX_LINE_BYTES: usize = 4096;
 pub const MAX_GROUPS: usize = 4;
 pub const MAX_WS_PER_GROUP: usize = 16;
 pub const MAX_WS_IDX: u8 = 32;
+pub const MAX_CLAUDE_SESSIONS: usize = 6;
+pub const MAX_SESSION_ID_LEN: usize = 64;
 pub const SUPPORTED_VERSION: u64 = 1;
 const MAX_CONSECUTIVE_INVALID: u32 = 8;
 const MAX_MSGS_PER_WINDOW: u32 = 200;
@@ -30,6 +32,21 @@ pub struct StateMsg {
     pub outs: Vec<OutputGroup>,
     #[serde(default)]
     pub vol: Option<Vol>,
+    // Pet-Claude presence: one critter per running Claude Code session.
+    #[serde(default)]
+    pub claude: Option<ClaudePresence>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct ClaudePresence {
+    #[serde(default)]
+    pub sessions: Vec<ClaudeSession>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct ClaudeSession {
+    #[serde(default)]
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -88,6 +105,14 @@ pub fn sanitize_state(mut state: StateMsg) -> StateMsg {
     state.outs.retain(|group| !group.ws.is_empty());
     if let Some(vol) = &mut state.vol {
         vol.level = vol.level.clamp(0.0, 1.0);
+    }
+    if let Some(claude) = &mut state.claude {
+        claude.sessions.truncate(MAX_CLAUDE_SESSIONS);
+        for session in &mut claude.sessions {
+            if session.id.len() > MAX_SESSION_ID_LEN {
+                session.id = session.id.chars().take(MAX_SESSION_ID_LEN).collect();
+            }
+        }
     }
     state
 }
@@ -251,6 +276,7 @@ mod tests {
         let state = sanitize_state(StateMsg {
             outs: groups,
             vol: None,
+            claude: None,
         });
 
         assert_eq!(state.outs.len(), MAX_GROUPS);
@@ -293,6 +319,7 @@ mod tests {
                 level: 1.35,
                 muted: false,
             }),
+            claude: None,
         });
 
         let ws = &state.outs[0].ws;
@@ -300,6 +327,25 @@ mod tests {
         assert_eq!(ws.iter().filter(|w| w.foc).count(), 1);
         assert!(ws[0].foc);
         assert_eq!(state.vol.unwrap().level, 1.0);
+    }
+
+    #[test]
+    fn sanitize_bounds_claude_sessions() {
+        let state = sanitize_state(StateMsg {
+            outs: vec![],
+            vol: None,
+            claude: Some(ClaudePresence {
+                sessions: (0..10)
+                    .map(|i| ClaudeSession {
+                        id: format!("{}{}", "x".repeat(100), i),
+                    })
+                    .collect(),
+            }),
+        });
+
+        let sessions = &state.claude.unwrap().sessions;
+        assert_eq!(sessions.len(), MAX_CLAUDE_SESSIONS);
+        assert!(sessions.iter().all(|s| s.id.len() <= MAX_SESSION_ID_LEN));
     }
 
     #[test]
@@ -330,6 +376,7 @@ mod tests {
                 },
             ],
             vol: None,
+            claude: None,
         });
 
         assert_eq!(state.outs.len(), 1);

@@ -43,6 +43,7 @@ use udev::MonitorBuilder;
 
 mod backlight;
 mod config;
+mod critters;
 mod display;
 mod fonts;
 mod helper_link;
@@ -54,6 +55,7 @@ mod sliders;
 use crate::config::ConfigManager;
 use backlight::BacklightManager;
 use config::{ButtonConfig, Config, SliderTarget, WorkspacesCfg};
+use critters::CritterField;
 use display::DrmBackend;
 use helper_link::HelperLink;
 use helper_proto::{Intent, WsEntry};
@@ -1380,6 +1382,20 @@ impl FunctionLayer {
         let min_origin = strip_geo.origin + strip_geo.width as f64 + BUTTON_SPACING_PX as f64;
         let anchor_x = self.overlay_stack.last().and_then(|frame| frame.anchor_x);
         controls_region(set.virtual_button_count, bar_width, min_origin, anchor_x)
+    }
+
+    // The empty middle between the strip and the visible controls — the pet
+    // Claudes' enclosure. None when this layer has no span worth wandering
+    // (Classic layers, or a wide anchored overlay covering the middle).
+    fn free_region(&self, bar_width: i32) -> Option<(f64, f64)> {
+        if self.kind != LayerKind::Regions {
+            return None;
+        }
+        let strip = strip_layout(&self.strip_groups, 0.0).region;
+        let controls = self.controls_geometry(self.visible(), bar_width);
+        let start = strip.origin + strip.width as f64 + 24.0;
+        let end = controls.origin - 24.0;
+        (end - start >= 80.0).then_some((start, end))
     }
 
     // Rebuild the strip from a helper model (empty = restore the static
@@ -3009,6 +3025,7 @@ fn real_main(drm: &mut DrmBackend) {
     let mut helper_fresh = false;
     let mut pending_strip_model: Option<Vec<Vec<WsEntry>>> = None;
     let mut last_structural_apply: Option<Instant> = None;
+    let mut critter_field = CritterField::default();
     loop {
         if cfg_mgr.reload_pending() {
             // Release in-flight touches against the outgoing layers before
@@ -3085,6 +3102,20 @@ fn real_main(drm: &mut DrmBackend) {
                     Vec::new()
                 });
                 let volume = fresh.then(|| link.state().vol).flatten().map(|v| v.level);
+                // Pet-Claude census: one critter per session while fresh.
+                let session_ids: Vec<String> = if fresh {
+                    link.state()
+                        .claude
+                        .as_ref()
+                        .map(|c| c.sessions.iter().map(|s| s.id.clone()).collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let spawn_region = layers[active_layer]
+                    .free_region(width as i32)
+                    .unwrap_or((300.0, (width as f64 - 300.0).max(400.0)));
+                critter_field.reconcile(&session_ids, spawn_region);
                 for layer in layers.iter_mut() {
                     layer.sync_sliders(&slider_backends, volume);
                 }
@@ -3136,20 +3167,62 @@ fn real_main(drm: &mut DrmBackend) {
             layers[active_layer].mark_battery_buttons_changed();
         }
 
-        if needs_complete_redraw || layers[active_layer].any_button_changed() {
+        // Advance the pet Claudes while they're visible: the free middle
+        // region exists (Regions layer active), sessions are running, and
+        // the bar is lit. Frames ride the epoll timeout like pixel shift.
+        let critter_region = layers[active_layer].free_region(width as i32);
+        let critters_visible =
+            critter_region.is_some() && !critter_field.is_empty() && backlight.current_bl() > 0;
+        let mut critters_dirty = false;
+        if critters_visible {
+            let region = critter_region.unwrap();
+            let now = Instant::now();
+            if critter_field.tick(now, region) {
+                critters_dirty = true;
+            }
+            if let Some(ms) = critter_field.wait_ms(Instant::now()) {
+                next_timeout_ms = min(next_timeout_ms, ms);
+            }
+        }
+
+        let layer_dirty = needs_complete_redraw || layers[active_layer].any_button_changed();
+        if layer_dirty || critters_dirty || (!critters_visible && critter_field.needs_erase()) {
             let shift = if cfg.enable_pixel_shift {
                 pixel_shift.get()
             } else {
                 (0.0, 0.0)
             };
-            let clips = layers[active_layer].draw(
-                &cfg,
-                width as i32,
-                height as i32,
-                &surface,
-                shift,
-                needs_complete_redraw,
-            );
+            let complete = needs_complete_redraw;
+            let mut clips = if layer_dirty {
+                layers[active_layer].draw(
+                    &cfg,
+                    width as i32,
+                    height as i32,
+                    &surface,
+                    shift,
+                    complete,
+                )
+            } else {
+                Vec::new()
+            };
+            // Critters paint after the layer so they sit on the (empty)
+            // middle; render also erases last frame's spans.
+            {
+                let c = Context::new(&surface).unwrap();
+                c.translate(height as f64, 0.0);
+                c.rotate((90.0f64).to_radians());
+                clips.extend(critter_field.render(
+                    &c,
+                    height as i32,
+                    width as i32,
+                    if critters_visible {
+                        critter_region
+                    } else {
+                        None
+                    },
+                    complete,
+                ));
+            }
             let data = surface.data().unwrap();
             drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
             drm.dirty(&clips).unwrap();

@@ -74,6 +74,12 @@ intent was added so taps can jump across monitors.
   fallback `[1]` strip.
 - `vol` (object or absent): `level` finite float clamped by the receiver to
   `[0.0, 1.0]`; `muted` bool. Absent → daemon keeps last-known volume.
+- `claude` (object or absent): pet-Claude presence —
+  `{"sessions":[{"id":"<session-uuid-or-pid:N>"},...]}`, one entry per
+  running Claude Code session on the machine. Ids are opaque strings
+  (receiver truncates to 64 chars, renders at most 6 critters). Strictly
+  render-input: critters have no hit targets and can never trigger keys,
+  sysfs writes, or intents. Absent → no critters.
 - **Full snapshots only, no deltas**: any single message fully repairs the
   daemon's view after drops or reconnects.
 - Sent: (a) debounced (~40 ms) on any derived-state change, (b) every **2 s**
