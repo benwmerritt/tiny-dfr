@@ -19,7 +19,9 @@ fi
 
 repo_root="${TINY_DFR_FORK_DIR:-/home/ben/dev/projects/tiny-dfr}"
 archdots_root="${ARCHDOTS_DIR:-/home/ben/archdots}"
-binary_src="$repo_root/target/release/tiny-dfr"
+# TINY_DFR_BINARY overrides which build gets installed (used by
+# install-ben-safe.sh to deploy the pre-critter dist/tiny-dfr-ben-safe).
+binary_src="${TINY_DFR_BINARY:-$repo_root/target/release/tiny-dfr}"
 config_src="$archdots_root/.config/tiny-dfr/config.toml"
 
 if [[ ! -x "$binary_src" ]]; then
@@ -129,6 +131,20 @@ EOF
 
 systemctl daemon-reload
 systemctl reset-failed tiny-dfr-ben.service tiny-dfr.service || true
+
+# If the running daemon is wedged in D-state on the stuck USB display channel,
+# systemctl restart below would hang on it forever. Reset the display first.
+if [[ -x "$repo_root/scripts/unwedge-touchbar.sh" ]]; then
+  main_pid="$(systemctl show -p MainPID --value tiny-dfr-ben.service 2>/dev/null || true)"
+  if [[ -n "$main_pid" && "$main_pid" != 0 ]] \
+    && [[ "$(awk '{print $3}' "/proc/$main_pid/stat" 2>/dev/null)" == D* ]]; then
+    echo "tiny-dfr-ben (pid $main_pid) is wedged in D-state; resetting the Touch Bar display first."
+    "$repo_root/scripts/unwedge-touchbar.sh" || {
+      echo "Unwedge failed; aborting before a restart that would hang. A reboot may be needed." >&2
+      exit 1
+    }
+  fi
+fi
 
 # tiny-dfr owns the Touch Bar DRM/input/uinput devices, so only one instance
 # should run at a time.

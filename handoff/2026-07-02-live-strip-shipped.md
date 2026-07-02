@@ -71,6 +71,26 @@ The complete original project goal plus the field revisions:
 - Old design-phasing M6 polish items (square sizing taste, docs sweep)
   fold into whatever session comes next.
 
+## Recovery / escape hatch (Ben-runnable, no agent needed)
+
+The critter animation can wedge the appletbdrm USB display channel
+(kernel spams `appletbdrm ... Failed to send message (-110)`, daemon stuck
+in D-state, bar frozen). Recovery ladder, mildest first:
+
+1. `unwedge-touchbar` — resets the 05ac:8302 USB device (software
+   replug; NOT the forbidden config force-switch). Detects the wedge
+   itself; no-ops when healthy. Script: `scripts/unwedge-touchbar.sh`.
+2. `rtouchbar` — normal install of the current build; now auto-unwedges
+   first if the daemon is D-state.
+3. `rtouchbar-safe` — installs `dist/tiny-dfr-ben-safe`, a prebuilt
+   binary from tag `ben-live/phase-c-live-strip`: the last
+   hardware-validated bar WITHOUT critters (live strip, anchored
+   overlays, sliders). Script: `scripts/install-ben-safe.sh` (has
+   rebuild instructions in its header).
+4. Stock upstream: `sudo systemctl disable --now tiny-dfr-ben.service &&
+   sudo systemctl enable --now tiny-dfr.service`.
+5. Reboot (only if the USB reset fails to re-enumerate).
+
 ## Safety rules (unchanged)
 
 No sudo/service restarts without Ben's explicit approval per action; stock
