@@ -75,6 +75,10 @@ const SLIDER_KNOB_RADIUS_PX: f64 = 14.0;
 const SLIDER_TRACK_COLOR: f64 = 0.10;
 // Minimum interval between slider value emissions during a drag.
 const SLIDER_EMIT_INTERVAL: Duration = Duration::from_millis(50);
+// Minimum interval between STRUCTURAL strip rebuilds (each one drains all
+// touches and forces a complete redraw); latest pending model wins. The real
+// helper debounces at 40ms, so this only bounds hostile/buggy senders.
+const STRIP_STRUCTURAL_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
 // A horizontal pill (rounded-ends rectangle) path; caller fills.
 fn draw_pill(c: &Context, x: f64, y: f64, width: f64, height: f64) {
@@ -1411,7 +1415,10 @@ impl FunctionLayer {
         if buttons.is_empty() {
             self.strip = ButtonSet::with_config(self.fallback_strip_cfg.clone());
             self.strip_groups = vec![self.strip.buttons.len()];
-            self.strip_model = Vec::new();
+            // Store the model AS APPLIED so classify's fixed point holds:
+            // re-applying the same degenerate model must be Unchanged, never
+            // an endless chain of structural rebuilds.
+            self.strip_model = model.to_vec();
         } else {
             self.strip = ButtonSet {
                 displays_time: false,
@@ -2500,6 +2507,47 @@ OpenOverlay = "volume""#,
     }
 
     #[test]
+    fn degenerate_model_rebuild_reaches_a_fixed_point() {
+        // Even a model that renders zero buttons (blocked upstream by
+        // sanitize, but rebuild must not rely on that) settles: reapplying
+        // the same model classifies Unchanged instead of churning rebuilds.
+        let mut layer = regions_layer(4);
+        let degenerate: Vec<Vec<WsEntry>> = vec![vec![]];
+
+        layer.rebuild_strip(&degenerate);
+        assert_eq!(
+            classify_strip_change(&layer.strip_model, &degenerate),
+            StripChange::Unchanged
+        );
+
+        // The apply path truncates before both classify and rebuild; that
+        // truncated view reaches its own fixed point too.
+        let truncated = truncate_model(&degenerate, 9);
+        layer.rebuild_strip(&truncated);
+        assert_eq!(
+            classify_strip_change(&layer.strip_model, &truncated),
+            StripChange::Unchanged
+        );
+    }
+
+    #[test]
+    fn truncate_model_respects_group_boundaries_and_cap() {
+        let model = vec![
+            (1..=7).map(|i| ws_entry(i as u64, i, false)).collect(),
+            (1..=7)
+                .map(|i| ws_entry(100 + i as u64, i, false))
+                .collect(),
+        ];
+
+        let truncated = truncate_model(&model, 9);
+
+        assert_eq!(truncated.len(), 2);
+        assert_eq!(truncated[0].len(), 7);
+        assert_eq!(truncated[1].len(), 2);
+        assert_eq!(truncate_model(&model, 20), model);
+    }
+
+    #[test]
     fn apply_identical_model_is_a_noop() {
         let mut uinput = null_uinput();
         let mut layers = [regions_layer(4), regions_layer(4)];
@@ -2740,6 +2788,26 @@ enum StripChange {
     Structural,
 }
 
+// Truncate a model to at most `cap` buttons, respecting group boundaries —
+// the same walk rebuild_strip renders with. Comparing models in rendered
+// terms means a change confined to never-rendered trailing entries can't
+// classify as structural and churn touches for a pixel-identical bar.
+fn truncate_model(model: &[Vec<WsEntry>], cap: usize) -> Vec<Vec<WsEntry>> {
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for group in model {
+        if total >= cap {
+            break;
+        }
+        let take = group.len().min(cap - total);
+        if take > 0 {
+            out.push(group[..take].to_vec());
+            total += take;
+        }
+    }
+    out
+}
+
 fn classify_strip_change(current: &[Vec<WsEntry>], new: &[Vec<WsEntry>]) -> StripChange {
     if current == new {
         return StripChange::Unchanged;
@@ -2772,7 +2840,10 @@ where
 {
     let any_structural = layers.iter().any(|layer| {
         layer.kind == LayerKind::Regions
-            && classify_strip_change(&layer.strip_model, model) == StripChange::Structural
+            && classify_strip_change(
+                &layer.strip_model,
+                &truncate_model(model, layer.strip_max_buttons),
+            ) == StripChange::Structural
     });
     if any_structural {
         drain_touches(layers, touches, uinput);
@@ -2782,17 +2853,18 @@ where
         if layer.kind != LayerKind::Regions {
             continue;
         }
-        match classify_strip_change(&layer.strip_model, model) {
+        let model = truncate_model(model, layer.strip_max_buttons);
+        match classify_strip_change(&layer.strip_model, &model) {
             StripChange::Unchanged => {}
             StripChange::Decoration => {
                 let flat = model.iter().flatten();
                 for ((_, button), entry) in layer.strip.buttons.iter_mut().zip(flat) {
                     button.set_highlighted(entry.foc);
                 }
-                layer.strip_model = model.to_vec();
+                layer.strip_model = model;
             }
             StripChange::Structural => {
-                layer.rebuild_strip(model);
+                layer.rebuild_strip(&model);
                 needs_complete_redraw = true;
             }
         }
@@ -2935,6 +3007,8 @@ fn real_main(drm: &mut DrmBackend) {
         Local::now().minute()
     };
     let mut helper_fresh = false;
+    let mut pending_strip_model: Option<Vec<Vec<WsEntry>>> = None;
+    let mut last_structural_apply: Option<Instant> = None;
     loop {
         if cfg_mgr.reload_pending() {
             // Release in-flight touches against the outgoing layers before
@@ -2995,24 +3069,21 @@ fn real_main(drm: &mut DrmBackend) {
             }
         }
 
-        // Service the helper socket: accept/read, then apply workspace and
-        // volume state whenever it changed or freshness flipped. The epoll
-        // wait is bounded by time-to-staleness so a silently hung helper
-        // degrades to the fallback strip within the 6s window.
+        // Service the helper socket: accept/read, then stage workspace state
+        // and apply volume whenever anything changed or freshness flipped.
+        // The epoll wait is bounded by time-to-staleness so a silently hung
+        // helper degrades to the fallback strip within the 6s window.
         if let Some(link) = helper_link.as_mut() {
             let now = Instant::now();
             let state_applied = link.pump(&epoll, now);
             let fresh = link.is_fresh(now);
             if state_applied || fresh != helper_fresh {
                 helper_fresh = fresh;
-                let model: Vec<Vec<WsEntry>> = if fresh {
+                pending_strip_model = Some(if fresh {
                     link.state().outs.iter().map(|g| g.ws.clone()).collect()
                 } else {
                     Vec::new()
-                };
-                if apply_helper_strip(&mut layers, &mut touches, &mut uinput, &model) {
-                    needs_complete_redraw = true;
-                }
+                });
                 let volume = fresh.then(|| link.state().vol).flatten().map(|v| v.level);
                 for layer in layers.iter_mut() {
                     layer.sync_sliders(&slider_backends, volume);
@@ -3020,6 +3091,35 @@ fn real_main(drm: &mut DrmBackend) {
             }
             if let Some(ms) = link.staleness_timeout_ms(Instant::now()) {
                 next_timeout_ms = min(next_timeout_ms, ms.min(TIMEOUT_MS));
+            }
+        }
+
+        // Apply the staged model, rate-limiting STRUCTURAL rebuilds (each
+        // drains all touches); decoration/no-op tiers apply immediately.
+        if let Some(model) = pending_strip_model.take() {
+            let now = Instant::now();
+            let structural = layers.iter().any(|layer| {
+                layer.kind == LayerKind::Regions
+                    && classify_strip_change(
+                        &layer.strip_model,
+                        &truncate_model(&model, layer.strip_max_buttons),
+                    ) == StripChange::Structural
+            });
+            let interval_elapsed = last_structural_apply.is_none_or(|at| {
+                now.saturating_duration_since(at) >= STRIP_STRUCTURAL_MIN_INTERVAL
+            });
+            if !structural || interval_elapsed {
+                if apply_helper_strip(&mut layers, &mut touches, &mut uinput, &model) {
+                    needs_complete_redraw = true;
+                    last_structural_apply = Some(now);
+                }
+            } else {
+                // Too soon after the last rebuild: hold the latest model and
+                // retry once the interval elapses (newer states replace it).
+                let wait = STRIP_STRUCTURAL_MIN_INTERVAL
+                    .saturating_sub(now.saturating_duration_since(last_structural_apply.unwrap()));
+                next_timeout_ms = min(next_timeout_ms, wait.as_millis().max(1) as i32);
+                pending_strip_model = Some(model);
             }
         }
 

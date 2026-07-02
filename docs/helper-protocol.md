@@ -93,7 +93,8 @@ intent was added so taps can jump across monitors.
   `wpctl set-mute @DEFAULT_AUDIO_SINK@ 0` on every set-volume intent — the
   slider is the single volume authority and dragging it un-mutes.
 - No acks: the resulting volume-change event → fresh `state` push is the ack.
-- The daemon rate-limits to one send per **40 ms, latest wins**, during drags.
+- The daemon rate-limits to one send per **50 ms, latest wins**, during drags
+  (the slider emission throttle), always flushing the final drag position.
 
 `focus-workspace`:
 

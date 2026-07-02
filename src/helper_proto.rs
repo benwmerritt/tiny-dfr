@@ -81,6 +81,11 @@ pub fn sanitize_state(mut state: StateMsg) -> StateMsg {
             }
         }
     }
+    // Empty groups must not survive: a divider never borders an empty group,
+    // and a non-empty model that renders zero buttons would break the strip
+    // updater's fixed point (classify would see it as structurally new on
+    // every heartbeat, draining touches forever).
+    state.outs.retain(|group| !group.ws.is_empty());
     if let Some(vol) = &mut state.vol {
         vol.level = vol.level.clamp(0.0, 1.0);
     }
@@ -295,6 +300,40 @@ mod tests {
         assert_eq!(ws.iter().filter(|w| w.foc).count(), 1);
         assert!(ws[0].foc);
         assert_eq!(state.vol.unwrap().level, 1.0);
+    }
+
+    #[test]
+    fn sanitize_drops_empty_groups() {
+        let state = sanitize_state(StateMsg {
+            outs: vec![
+                OutputGroup {
+                    name: "empty".into(),
+                    ws: vec![],
+                },
+                OutputGroup {
+                    name: "bad-idx-only".into(),
+                    ws: vec![WsEntry {
+                        id: 1,
+                        idx: 0,
+                        occ: true,
+                        foc: false,
+                    }],
+                },
+                OutputGroup {
+                    name: "eDP-1".into(),
+                    ws: vec![WsEntry {
+                        id: 2,
+                        idx: 1,
+                        occ: true,
+                        foc: false,
+                    }],
+                },
+            ],
+            vol: None,
+        });
+
+        assert_eq!(state.outs.len(), 1);
+        assert_eq!(state.outs[0].name, "eDP-1");
     }
 
     #[test]

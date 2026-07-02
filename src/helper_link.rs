@@ -142,6 +142,9 @@ impl HelperLink {
         Ok(())
     }
 
+    // Deliberately keeps `state`/`last_state_at`: a quick helper reconnect
+    // (newest-wins replacement) shouldn't flash the fallback strip, and the
+    // staleness clock still bounds how long cached state can be rendered.
     fn drop_client(&mut self, epoll: &Epoll) {
         if let Some(client) = self.client.take() {
             let _ = epoll.delete(&client.stream);
@@ -231,6 +234,10 @@ impl HelperLink {
         let Some(client) = self.client.as_mut() else {
             return;
         };
+        // Never talk to a peer that hasn't completed the hello handshake.
+        if !client.hello_done {
+            return;
+        }
         let payload = encode_intent(intent);
         match client.stream.write(payload.as_bytes()) {
             Ok(n) if n == payload.len() => {}
