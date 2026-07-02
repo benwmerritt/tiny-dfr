@@ -35,6 +35,11 @@ pub struct Config {
     // cannot change them (the reloaded values are ignored).
     pub display_backlight_path: PathBuf,
     pub kbd_backlight_path: PathBuf,
+    // Uid allowed to connect to the helper socket (also fixed at process
+    // start: the socket is bound and chowned pre-privdrop). Consumed when
+    // the link is wired into the event loop.
+    #[allow(dead_code)]
+    pub helper_uid: u32,
 }
 
 // What an absolute-position slider button controls.
@@ -58,6 +63,7 @@ struct ConfigProxy {
     overlay_timeout_ms: Option<u64>,
     display_backlight_path: Option<String>,
     kbd_backlight_path: Option<String>,
+    helper_uid: Option<u32>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
     control_groups: Option<HashMap<String, Vec<ButtonConfig>>>,
@@ -207,6 +213,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         base.overlay_timeout_ms = user.overlay_timeout_ms.or(base.overlay_timeout_ms);
         base.display_backlight_path = user.display_backlight_path.or(base.display_backlight_path);
         base.kbd_backlight_path = user.kbd_backlight_path.or(base.kbd_backlight_path);
+        base.helper_uid = user.helper_uid.or(base.helper_uid);
         base.active_brightness = user.active_brightness.or(base.active_brightness);
         base.double_press_switch_layers = user
             .double_press_switch_layers
@@ -273,6 +280,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
             base.kbd_backlight_path
                 .unwrap_or_else(|| DEFAULT_KBD_BACKLIGHT.into()),
         ),
+        helper_uid: base.helper_uid.unwrap_or(1000),
     };
     (cfg, layers)
 }
