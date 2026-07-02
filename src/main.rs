@@ -45,19 +45,18 @@ mod backlight;
 mod config;
 mod display;
 mod fonts;
+mod helper_link;
+mod helper_proto;
 mod layout;
 mod pixel_shift;
-// Consumed by the helper socket link as it lands; allow until fully wired.
-#[allow(dead_code)]
-mod helper_link;
-#[allow(dead_code)]
-mod helper_proto;
 mod sliders;
 
 use crate::config::ConfigManager;
 use backlight::BacklightManager;
 use config::{ButtonConfig, Config, SliderTarget, WorkspacesCfg};
 use display::DrmBackend;
+use helper_link::HelperLink;
+use helper_proto::{Intent, WsEntry};
 use layout::{
     button_spans, controls_region, hit_in_spans, hit_index, strip_layout, ButtonSpan, LayoutSpec,
     RegionGeometry, CONTROL_SPACING_PX as BUTTON_SPACING_PX,
@@ -247,6 +246,10 @@ enum ButtonAction {
     OpenOverlay(String),
     CloseOverlay,
     Slider(SliderTarget),
+    // Live workspace buttons: emits a typed socket intent on release, never
+    // uinput keys. Not expressible from config; only the strip rebuild
+    // produces it.
+    FocusWorkspace(u64),
     None,
 }
 
@@ -271,6 +274,7 @@ impl ButtonAction {
             ButtonAction::OpenOverlay(_)
             | ButtonAction::CloseOverlay
             | ButtonAction::Slider(_)
+            | ButtonAction::FocusWorkspace(_)
             | ButtonAction::None => &[],
         }
     }
@@ -1013,10 +1017,14 @@ pub struct FunctionLayer {
     // Regions only: the pinned workspace strip. Static fallback content until
     // live compositor state arrives over the control socket. strip_groups
     // holds the per-output button counts driving the grouped layout (one
-    // group while on fallback content).
+    // group while on fallback content); strip_model caches the applied
+    // helper model for change classification (empty = fallback showing).
     strip: ButtonSet,
     strip_groups: Vec<usize>,
     strip_generation: u64,
+    strip_model: Vec<Vec<WsEntry>>,
+    fallback_strip_cfg: Vec<ButtonConfig>,
+    strip_max_buttons: usize,
 }
 
 // Milliseconds until the overlay auto-close is due (0 = due now); None when
@@ -1034,15 +1042,16 @@ fn overlay_timeout_remaining_ms(
     Some(remaining.as_millis().min(i32::MAX as u128) as i32)
 }
 
-fn fallback_strip_set(workspaces: &WorkspacesCfg) -> ButtonSet {
-    let buttons = (1..=workspaces.fallback_buttons)
+// The static strip shown whenever no live compositor state exists: plain
+// key-emitting workspace buttons that work with the helper dead.
+fn fallback_strip_cfg(workspaces: &WorkspacesCfg) -> Vec<ButtonConfig> {
+    (1..=workspaces.fallback_buttons)
         .map(|idx| ButtonConfig {
             text: Some(idx.to_string()),
             action: workspaces.action_for(idx),
             ..Default::default()
         })
-        .collect();
-    ButtonSet::with_config(buttons)
+        .collect()
 }
 
 impl FunctionLayer {
@@ -1056,13 +1065,16 @@ impl FunctionLayer {
             .into_iter()
             .map(|(name, cfg)| (name, ButtonSet::with_config(cfg)))
             .collect();
-        let (kind, strip, strip_groups) = match workspaces {
-            Some(ws) => (
-                LayerKind::Regions,
-                fallback_strip_set(ws),
-                vec![ws.fallback_buttons],
-            ),
-            None => (LayerKind::Classic, ButtonSet::default(), Vec::new()),
+        let (kind, fallback_cfg, strip_max_buttons) = match workspaces {
+            Some(ws) => (LayerKind::Regions, fallback_strip_cfg(ws), ws.max_buttons),
+            None => (LayerKind::Classic, Vec::new(), 0),
+        };
+        let (strip, strip_groups) = if kind == LayerKind::Regions {
+            let strip = ButtonSet::with_config(fallback_cfg.clone());
+            let count = strip.buttons.len();
+            (strip, vec![count])
+        } else {
+            (ButtonSet::default(), Vec::new())
         };
         FunctionLayer {
             kind,
@@ -1073,6 +1085,9 @@ impl FunctionLayer {
             strip,
             strip_groups,
             strip_generation: 0,
+            strip_model: Vec::new(),
+            fallback_strip_cfg: fallback_cfg,
+            strip_max_buttons,
         }
     }
 
@@ -1238,8 +1253,9 @@ impl FunctionLayer {
     }
 
     // Seed the visible set's sliders from their backends so the widget always
-    // reflects reality when an overlay opens. Never touches a mid-drag slider.
-    fn sync_sliders(&mut self, backends: &SliderBackends) {
+    // reflects reality when an overlay opens. Never touches a mid-drag slider
+    // (the echo-fight rule: the finger wins while dragging).
+    fn sync_sliders(&mut self, backends: &SliderBackends, volume: Option<f64>) {
         let key = self.controls_key();
         let Some(set) = self.button_set_mut(&key) else {
             return;
@@ -1256,8 +1272,9 @@ impl FunctionLayer {
                 SliderTarget::KeyboardBrightness => {
                     backends.keyboard.as_ref().and_then(|s| s.read_value())
                 }
-                // Volume state arrives over the control socket (M4).
-                SliderTarget::Volume => None,
+                // Pushed by the helper; None (helper stale or silent) keeps
+                // the last-known position.
+                SliderTarget::Volume => volume,
             };
             if let (Some(value), Some(state)) = (value, button.slider_state_mut()) {
                 if !state.dragging && state.value != value {
@@ -1342,8 +1359,12 @@ impl FunctionLayer {
         match action {
             ButtonAction::OpenOverlay(name) => self.open_overlay(&name, anchor_x),
             ButtonAction::CloseOverlay => self.close_top_overlay(),
-            // Sliders act during the drag, never on release.
-            ButtonAction::Keys(_) | ButtonAction::Slider(_) | ButtonAction::None => false,
+            // Sliders act during the drag; FocusWorkspace emits its intent in
+            // the Up handler and deliberately leaves overlays alone.
+            ButtonAction::Keys(_)
+            | ButtonAction::Slider(_)
+            | ButtonAction::FocusWorkspace(_)
+            | ButtonAction::None => false,
         }
     }
 
@@ -1355,6 +1376,54 @@ impl FunctionLayer {
         let min_origin = strip_geo.origin + strip_geo.width as f64 + BUTTON_SPACING_PX as f64;
         let anchor_x = self.overlay_stack.last().and_then(|frame| frame.anchor_x);
         controls_region(set.virtual_button_count, bar_width, min_origin, anchor_x)
+    }
+
+    // Rebuild the strip from a helper model (empty = restore the static
+    // fallback). PRECONDITION: the caller has drained ALL touches — the
+    // generation bump below invalidates every in-flight strip entry, and a
+    // key-down entry on an unreachable set can never be released again.
+    fn rebuild_strip(&mut self, model: &[Vec<WsEntry>]) {
+        let mut buttons = Vec::new();
+        let mut groups = Vec::new();
+        let mut total = 0usize;
+        for group in model {
+            let mut size = 0usize;
+            for entry in group {
+                if total >= self.strip_max_buttons {
+                    break;
+                }
+                let mut button = Button::new_text(
+                    entry.idx.to_string(),
+                    ButtonAction::FocusWorkspace(entry.id),
+                );
+                button.set_highlighted(entry.foc);
+                buttons.push((total, button));
+                size += 1;
+                total += 1;
+            }
+            if size > 0 {
+                groups.push(size);
+            }
+            if total >= self.strip_max_buttons {
+                break;
+            }
+        }
+        if buttons.is_empty() {
+            self.strip = ButtonSet::with_config(self.fallback_strip_cfg.clone());
+            self.strip_groups = vec![self.strip.buttons.len()];
+            self.strip_model = Vec::new();
+        } else {
+            self.strip = ButtonSet {
+                displays_time: false,
+                displays_battery: false,
+                virtual_button_count: buttons.len(),
+                buttons,
+                faster_refresh: false,
+            };
+            self.strip_groups = groups;
+            self.strip_model = model.to_vec();
+        }
+        self.strip_generation += 1;
     }
 
     fn draw(
@@ -1664,7 +1733,9 @@ mod function_layer_tests {
             ButtonAction::Keys(keys) => (None, None, keys),
             ButtonAction::OpenOverlay(name) => (Some(name), None, vec![]),
             ButtonAction::CloseOverlay => (None, Some(true), vec![]),
-            ButtonAction::Slider(_) | ButtonAction::None => (None, None, vec![]),
+            ButtonAction::Slider(_) | ButtonAction::FocusWorkspace(_) | ButtonAction::None => {
+                (None, None, vec![])
+            }
         };
         ButtonConfig {
             text: Some(text.to_string()),
@@ -2292,7 +2363,7 @@ OpenOverlay = "volume""#,
         let backends = SliderBackends::new(&dir, &missing);
         assert!(layer.open_overlay("bright", None));
 
-        layer.sync_sliders(&backends);
+        layer.sync_sliders(&backends, None);
 
         let key = ButtonSetKey::Overlay("bright".to_string());
         let button = layer.button_mut_in_set(&key, 0).unwrap();
@@ -2311,7 +2382,7 @@ OpenOverlay = "volume""#,
         let key = ButtonSetKey::Overlay("bright".to_string());
         layer.update_slider(&key, 0, Some(0.9), true);
 
-        layer.sync_sliders(&backends);
+        layer.sync_sliders(&backends, None);
 
         let button = layer.button_mut_in_set(&key, 0).unwrap();
         assert_eq!(button.slider_state_mut().unwrap().value, 0.9);
@@ -2333,6 +2404,161 @@ OpenOverlay = "volume""#,
 
         layer.update_slider(&key, 0, None, false);
         assert!(layer.button_mut_in_set(&key, 0).unwrap().changed);
+    }
+
+    fn ws_entry(id: u64, idx: u8, foc: bool) -> WsEntry {
+        WsEntry {
+            id,
+            idx,
+            occ: true,
+            foc,
+        }
+    }
+
+    #[test]
+    fn focus_workspace_action_is_key_free_and_inert() {
+        let mut uinput = null_uinput();
+        let action = ButtonAction::FocusWorkspace(9);
+
+        assert!(action.keys().is_empty());
+
+        let mut layer = regions_layer(4);
+        assert!(layer.open_overlay("canary", None));
+        assert!(!layer.activate_button_action(action, None));
+        assert!(layer.has_open_overlay());
+
+        // Pressing a live workspace button emits nothing through uinput.
+        let mut button = Button::new_text("1".into(), ButtonAction::FocusWorkspace(9));
+        button.set_active(&mut uinput, true);
+        button.set_active(&mut uinput, false);
+        assert!(!button.pressed);
+    }
+
+    #[test]
+    fn rebuild_strip_builds_labels_actions_and_highlight() {
+        let mut layer = regions_layer(4);
+        let generation_before = layer.strip_generation;
+        let model = vec![
+            vec![ws_entry(7, 1, false), ws_entry(9, 2, true)],
+            vec![ws_entry(3, 1, false)],
+        ];
+
+        layer.rebuild_strip(&model);
+
+        assert_eq!(layer.strip.buttons.len(), 3);
+        assert_eq!(layer.strip_groups, vec![2, 1]);
+        assert_eq!(layer.strip_generation, generation_before + 1);
+        let labels: Vec<String> = layer
+            .strip
+            .buttons
+            .iter()
+            .map(|(_, b)| match &b.image {
+                ButtonImage::Text(t) => t.clone(),
+                _ => panic!("workspace buttons are text"),
+            })
+            .collect();
+        assert_eq!(labels, vec!["1", "2", "1"]);
+        assert_eq!(
+            layer.strip.buttons[1].1.action,
+            ButtonAction::FocusWorkspace(9)
+        );
+        assert!(layer.strip.buttons[1].1.highlighted);
+        assert!(!layer.strip.buttons[0].1.highlighted);
+    }
+
+    #[test]
+    fn rebuild_strip_truncates_at_max_buttons() {
+        let mut layer = regions_layer(4); // ws_cfg max_buttons = 9
+        let model = vec![
+            (1..=7).map(|i| ws_entry(i as u64, i, false)).collect(),
+            (1..=7)
+                .map(|i| ws_entry(100 + i as u64, i, false))
+                .collect(),
+        ];
+
+        layer.rebuild_strip(&model);
+
+        assert_eq!(layer.strip.buttons.len(), 9);
+        assert_eq!(layer.strip_groups, vec![7, 2]);
+    }
+
+    #[test]
+    fn rebuild_with_empty_model_restores_fallback() {
+        let mut layer = regions_layer(4);
+        layer.rebuild_strip(&[vec![ws_entry(7, 1, true)]]);
+
+        layer.rebuild_strip(&[]);
+
+        assert_eq!(layer.strip.buttons.len(), 4);
+        assert_eq!(layer.strip_groups, vec![4]);
+        // Fallback buttons emit plain keys and work with the helper dead.
+        assert_eq!(
+            layer.strip.buttons[0].1.action,
+            ButtonAction::Keys(vec![Key::LeftAlt, Key::Num1])
+        );
+        assert!(layer.strip_model.is_empty());
+    }
+
+    #[test]
+    fn apply_identical_model_is_a_noop() {
+        let mut uinput = null_uinput();
+        let mut layers = [regions_layer(4), regions_layer(4)];
+        let mut touches: HashMap<i32, (usize, ButtonSetKey, usize)> = HashMap::new();
+        let model = vec![vec![ws_entry(7, 1, true)]];
+        apply_helper_strip(&mut layers, &mut touches, &mut uinput, &model);
+        let generation = layers[0].strip_generation;
+        touches.insert(1, (0, ButtonSetKey::Strip(generation), 0));
+
+        let redraw = apply_helper_strip(&mut layers, &mut touches, &mut uinput, &model);
+
+        assert!(!redraw);
+        assert_eq!(layers[0].strip_generation, generation);
+        assert_eq!(touches.len(), 1); // heartbeat never drains
+    }
+
+    #[test]
+    fn decoration_change_moves_highlight_without_drain_or_rebuild() {
+        let mut uinput = null_uinput();
+        let mut layers = [regions_layer(4), regions_layer(4)];
+        let mut touches: HashMap<i32, (usize, ButtonSetKey, usize)> = HashMap::new();
+        let before = vec![vec![ws_entry(7, 1, true), ws_entry(9, 2, false)]];
+        apply_helper_strip(&mut layers, &mut touches, &mut uinput, &before);
+        let generation = layers[0].strip_generation;
+        touches.insert(1, (0, ButtonSetKey::Strip(generation), 0));
+
+        let after = vec![vec![ws_entry(7, 1, false), ws_entry(9, 2, true)]];
+        let redraw = apply_helper_strip(&mut layers, &mut touches, &mut uinput, &after);
+
+        assert!(!redraw);
+        assert_eq!(layers[0].strip_generation, generation);
+        assert_eq!(touches.len(), 1); // no drain: an in-flight drag survives
+        assert!(!layers[0].strip.buttons[0].1.highlighted);
+        assert!(layers[0].strip.buttons[1].1.highlighted);
+    }
+
+    #[test]
+    fn structural_change_drains_before_generation_bump() {
+        let mut uinput = null_uinput();
+        let mut layers = [regions_layer(4), regions_layer(4)];
+        let mut touches: HashMap<i32, (usize, ButtonSetKey, usize)> = HashMap::new();
+        let before = vec![vec![ws_entry(7, 1, true)]];
+        apply_helper_strip(&mut layers, &mut touches, &mut uinput, &before);
+        let generation = layers[0].strip_generation;
+        // A finger holding a live strip button when the workspace set changes.
+        let strip_key = ButtonSetKey::Strip(generation);
+        layers[0]
+            .button_mut_in_set(&strip_key, 0)
+            .unwrap()
+            .set_active(&mut uinput, true);
+        touches.insert(1, (0, strip_key, 0));
+
+        let after = vec![vec![ws_entry(7, 1, true), ws_entry(9, 2, false)]];
+        let redraw = apply_helper_strip(&mut layers, &mut touches, &mut uinput, &after);
+
+        assert!(redraw);
+        assert!(touches.is_empty()); // drained BEFORE the bump released it
+        assert_eq!(layers[0].strip_generation, generation + 1);
+        assert_eq!(layers[0].strip.buttons.len(), 2);
     }
 
     #[test]
@@ -2435,7 +2661,13 @@ where
     );
 }
 
-fn emit_slider(target: SliderTarget, value: f64, backends: &mut SliderBackends) {
+fn emit_slider(
+    target: SliderTarget,
+    value: f64,
+    backends: &mut SliderBackends,
+    link: &mut Option<HelperLink>,
+    epoll: &Epoll,
+) {
     match target {
         SliderTarget::DisplayBrightness => {
             if let Some(slider) = backends.display.as_mut() {
@@ -2447,10 +2679,23 @@ fn emit_slider(target: SliderTarget, value: f64, backends: &mut SliderBackends) 
                 slider.write_value(value);
             }
         }
-        // Volume flows as a typed intent over the control socket (M4);
-        // dropped silently until that lands.
-        SliderTarget::Volume => {}
+        // A typed intent to the user-session helper; silently dropped while
+        // no helper is connected (the slider stays visually live and re-syncs
+        // from pushed state).
+        SliderTarget::Volume => {
+            if let Some(link) = link.as_mut() {
+                link.send_intent(epoll, &Intent::SetVolume(value));
+            }
+        }
     }
+}
+
+// The helper's last pushed volume, honored only while its state is fresh.
+fn helper_volume(link: &Option<HelperLink>, now: Instant) -> Option<f64> {
+    link.as_ref()
+        .filter(|link| link.is_fresh(now))
+        .and_then(|link| link.state().vol)
+        .map(|vol| vol.level)
 }
 
 // The single invalidation path for the touch map: every route that hides or
@@ -2482,6 +2727,77 @@ fn drain_touches<K, F>(
         // entries: any path that makes a set unreachable (strip generation
         // bump, config reload) is required to drain BEFORE the change.
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StripChange {
+    Unchanged,
+    // Same ids/labels/shape; only occ/foc flags differ. Highlights update in
+    // place with no generation bump and no drain — a keyboard workspace
+    // switch never kills an in-flight drag.
+    Decoration,
+    // Ids, counts, or grouping changed: buttons must be rebuilt.
+    Structural,
+}
+
+fn classify_strip_change(current: &[Vec<WsEntry>], new: &[Vec<WsEntry>]) -> StripChange {
+    if current == new {
+        return StripChange::Unchanged;
+    }
+    let same_shape = current.len() == new.len()
+        && current.iter().zip(new).all(|(a, b)| {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.id == y.id && x.idx == y.idx)
+        });
+    if same_shape {
+        StripChange::Decoration
+    } else {
+        StripChange::Structural
+    }
+}
+
+// Apply a helper workspace model to every Regions layer, choosing the
+// cheapest sufficient tier. Heartbeats (identical models) cost nothing;
+// structural changes drain ALL touches BEFORE any generation bump (the
+// drain_touches contract) and force a complete redraw because region
+// origins move. Returns whether a complete redraw is needed.
+fn apply_helper_strip<K, F>(
+    layers: &mut [FunctionLayer; 2],
+    touches: &mut HashMap<K, (usize, ButtonSetKey, usize)>,
+    uinput: &mut UInputHandle<F>,
+    model: &[Vec<WsEntry>],
+) -> bool
+where
+    K: Eq + std::hash::Hash,
+    F: AsRawFd,
+{
+    let any_structural = layers.iter().any(|layer| {
+        layer.kind == LayerKind::Regions
+            && classify_strip_change(&layer.strip_model, model) == StripChange::Structural
+    });
+    if any_structural {
+        drain_touches(layers, touches, uinput);
+    }
+    let mut needs_complete_redraw = false;
+    for layer in layers.iter_mut() {
+        if layer.kind != LayerKind::Regions {
+            continue;
+        }
+        match classify_strip_change(&layer.strip_model, model) {
+            StripChange::Unchanged => {}
+            StripChange::Decoration => {
+                let flat = model.iter().flatten();
+                for ((_, button), entry) in layer.strip.buttons.iter_mut().zip(flat) {
+                    button.set_highlighted(entry.foc);
+                }
+                layer.strip_model = model.to_vec();
+            }
+            StripChange::Structural => {
+                layer.rebuild_strip(model);
+                needs_complete_redraw = true;
+            }
+        }
+    }
+    needs_complete_redraw
 }
 
 fn main() {
@@ -2525,6 +2841,17 @@ fn real_main(drm: &mut DrmBackend) {
     let mut slider_backends =
         SliderBackends::new(&cfg.display_backlight_path, &cfg.kbd_backlight_path);
     let mut slider_throttle = EmitThrottle::new();
+    // The helper socket also needs root (bind + chown inside the root-owned
+    // RuntimeDirectory). Missing directory (e.g. stock unit without
+    // RuntimeDirectory=) degrades to fallback-strip-only operation.
+    let mut helper_link =
+        match HelperLink::bind(Path::new("/run/tiny-dfr-ben/helper.sock"), cfg.helper_uid) {
+            Ok(link) => Some(link),
+            Err(e) => {
+                eprintln!("helper socket unavailable: {e:#}");
+                None
+            }
+        };
 
     // drop privileges to input and video group
     let groups = ["input", "video"];
@@ -2563,6 +2890,12 @@ fn real_main(drm: &mut DrmBackend) {
     epoll
         .add(&udev_monitor, EpollEvent::new(EpollFlags::EPOLLIN, 3))
         .unwrap();
+    if let Some(link) = &helper_link {
+        if let Err(e) = link.register(&epoll) {
+            eprintln!("helper socket epoll registration failed: {e:#}");
+            helper_link = None;
+        }
+    }
     uinput.set_evbit(EventKind::Key).unwrap();
     for k in Key::iter() {
         uinput.set_keybit(k).unwrap();
@@ -2591,13 +2924,17 @@ fn real_main(drm: &mut DrmBackend) {
     // Seed any sliders visible at startup (base-layer sliders would otherwise
     // render at 0.0 until the first overlay transition).
     for layer in layers.iter_mut() {
-        layer.sync_sliders(&slider_backends);
+        layer.sync_sliders(
+            &slider_backends,
+            helper_volume(&helper_link, Instant::now()),
+        );
     }
     let mut last_redraw_ts = if layers[active_layer].faster_refresh() {
         Local::now().second()
     } else {
         Local::now().minute()
     };
+    let mut helper_fresh = false;
     loop {
         if cfg_mgr.reload_pending() {
             // Release in-flight touches against the outgoing layers before
@@ -2631,7 +2968,10 @@ fn real_main(drm: &mut DrmBackend) {
                 // Never auto-close under an active touch; the anchor refreshes
                 // on release, restarting the idle window.
                 if layers[active_layer].close_all_overlays() {
-                    layers[active_layer].sync_sliders(&slider_backends);
+                    layers[active_layer].sync_sliders(
+                        &slider_backends,
+                        helper_volume(&helper_link, Instant::now()),
+                    );
                     needs_complete_redraw = true;
                 }
             }
@@ -2642,10 +2982,44 @@ fn real_main(drm: &mut DrmBackend) {
         {
             let now = Instant::now();
             if let Some((target, value)) = slider_throttle.take_due(now) {
-                emit_slider(target, value, &mut slider_backends);
+                emit_slider(
+                    target,
+                    value,
+                    &mut slider_backends,
+                    &mut helper_link,
+                    &epoll,
+                );
             }
             if let Some(wait_ms) = slider_throttle.pending_wait_ms(now) {
                 next_timeout_ms = min(next_timeout_ms, wait_ms);
+            }
+        }
+
+        // Service the helper socket: accept/read, then apply workspace and
+        // volume state whenever it changed or freshness flipped. The epoll
+        // wait is bounded by time-to-staleness so a silently hung helper
+        // degrades to the fallback strip within the 6s window.
+        if let Some(link) = helper_link.as_mut() {
+            let now = Instant::now();
+            let state_applied = link.pump(&epoll, now);
+            let fresh = link.is_fresh(now);
+            if state_applied || fresh != helper_fresh {
+                helper_fresh = fresh;
+                let model: Vec<Vec<WsEntry>> = if fresh {
+                    link.state().outs.iter().map(|g| g.ws.clone()).collect()
+                } else {
+                    Vec::new()
+                };
+                if apply_helper_strip(&mut layers, &mut touches, &mut uinput, &model) {
+                    needs_complete_redraw = true;
+                }
+                let volume = fresh.then(|| link.state().vol).flatten().map(|v| v.level);
+                for layer in layers.iter_mut() {
+                    layer.sync_sliders(&slider_backends, volume);
+                }
+            }
+            if let Some(ms) = link.staleness_timeout_ms(Instant::now()) {
+                next_timeout_ms = min(next_timeout_ms, ms.min(TIMEOUT_MS));
             }
         }
 
@@ -2797,7 +3171,13 @@ fn real_main(drm: &mut DrmBackend) {
                                                     value,
                                                     Instant::now(),
                                                 ) {
-                                                    emit_slider(t, v, &mut slider_backends);
+                                                    emit_slider(
+                                                        t,
+                                                        v,
+                                                        &mut slider_backends,
+                                                        &mut helper_link,
+                                                        &epoll,
+                                                    );
                                                 }
                                             }
                                         }
@@ -2820,7 +3200,10 @@ fn real_main(drm: &mut DrmBackend) {
                                 HitOutcome::OutsideControls => {
                                     drain_touches(&mut layers, &mut touches, &mut uinput);
                                     if layers[active_layer].close_all_overlays() {
-                                        layers[active_layer].sync_sliders(&slider_backends);
+                                        layers[active_layer].sync_sliders(
+                                            &slider_backends,
+                                            helper_volume(&helper_link, Instant::now()),
+                                        );
                                         needs_complete_redraw = true;
                                     }
                                 }
@@ -2855,7 +3238,13 @@ fn real_main(drm: &mut DrmBackend) {
                                         if let Some((t, v)) =
                                             slider_throttle.offer(target, value, Instant::now())
                                         {
-                                            emit_slider(t, v, &mut slider_backends);
+                                            emit_slider(
+                                                t,
+                                                v,
+                                                &mut slider_backends,
+                                                &mut helper_link,
+                                                &epoll,
+                                            );
                                         }
                                     }
                                 }
@@ -2880,7 +3269,13 @@ fn real_main(drm: &mut DrmBackend) {
                                 layers[layer].update_slider(&button_set, btn, None, false);
                                 if let Some((t, v)) = slider_throttle.flush(target, Instant::now())
                                 {
-                                    emit_slider(t, v, &mut slider_backends);
+                                    emit_slider(
+                                        t,
+                                        v,
+                                        &mut slider_backends,
+                                        &mut helper_link,
+                                        &epoll,
+                                    );
                                 }
                                 continue;
                             }
@@ -2893,7 +3288,14 @@ fn real_main(drm: &mut DrmBackend) {
                                 button.set_active(&mut uinput, false);
                             }
                             if hit && can_activate {
-                                if let Some(action) = action {
+                                if let Some(ButtonAction::FocusWorkspace(id)) = action {
+                                    // Live workspace tap: a typed intent to
+                                    // the helper, which validates the id
+                                    // against live niri before acting.
+                                    if let Some(link) = helper_link.as_mut() {
+                                        link.send_intent(&epoll, &Intent::FocusWorkspace(id));
+                                    }
+                                } else if let Some(action) = action {
                                     // The launcher's span, resolved under
                                     // pre-activation geometry, becomes the
                                     // anchor the opened overlay expands from.
@@ -2902,7 +3304,10 @@ fn real_main(drm: &mut DrmBackend) {
                                         .map(|(left, _)| left);
                                     if layers[layer].activate_button_action(action, anchor) {
                                         drain_touches(&mut layers, &mut touches, &mut uinput);
-                                        layers[layer].sync_sliders(&slider_backends);
+                                        layers[layer].sync_sliders(
+                                            &slider_backends,
+                                            helper_volume(&helper_link, Instant::now()),
+                                        );
                                         needs_complete_redraw = true;
                                     }
                                 }
@@ -2921,7 +3326,13 @@ fn real_main(drm: &mut DrmBackend) {
                                     if let Some((t, v)) =
                                         slider_throttle.flush(target, Instant::now())
                                     {
-                                        emit_slider(t, v, &mut slider_backends);
+                                        emit_slider(
+                                            t,
+                                            v,
+                                            &mut slider_backends,
+                                            &mut helper_link,
+                                            &epoll,
+                                        );
                                     }
                                 } else if let Some(button) =
                                     layers[layer].button_mut_in_set(&button_set, btn)
