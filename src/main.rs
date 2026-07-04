@@ -1387,10 +1387,11 @@ impl FunctionLayer {
     }
 
     // The empty middle between the strip and the visible controls — the pet
-    // Claudes' enclosure. None when this layer has no span worth wandering
-    // (Classic layers, or a wide anchored overlay covering the middle).
+    // Claudes' enclosure and now-playing slot. None when this layer has no
+    // span worth wandering, or while an overlay is open and the middle acts
+    // as the tap-outside-to-close zone.
     fn free_region(&self, bar_width: i32) -> Option<(f64, f64)> {
-        if self.kind != LayerKind::Regions {
+        if self.kind != LayerKind::Regions || self.has_open_overlay() {
             return None;
         }
         let strip = strip_layout(&self.strip_groups, 0.0).region;
@@ -2007,6 +2008,17 @@ mod function_layer_tests {
             layer.hit_target(BAR_WIDTH, BAR_HEIGHT, 42.0, 30.0),
             HitOutcome::Button(ButtonSetKey::Strip(0), 0)
         ));
+    }
+
+    #[test]
+    fn free_region_hides_while_overlay_is_open() {
+        let mut layer = regions_layer(4);
+
+        assert!(layer.free_region(BAR_WIDTH as i32).is_some());
+        assert!(layer.open_overlay("canary", None));
+        assert_eq!(layer.free_region(BAR_WIDTH as i32), None);
+        assert!(layer.close_all_overlays());
+        assert!(layer.free_region(BAR_WIDTH as i32).is_some());
     }
 
     #[test]
