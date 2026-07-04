@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const ART_SIZE_PX: i32 = 36;
+const ART_SIZE_PX: i32 = 42;
 const MAX_ART_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WIDGET_WIDTH_PX: f64 = 440.0;
 const MIN_WIDGET_WIDTH_PX: f64 = 180.0;
@@ -16,6 +16,7 @@ const TITLE_FONT_SIZE: f64 = 19.0;
 const ARTIST_FONT_SIZE: f64 = 13.0;
 const CONTROL_GAP_PX: f64 = 16.0;
 const BUTTON_BACKGROUND: f64 = 0.200;
+const BUTTON_RADIUS_PX: f64 = 8.0;
 
 #[derive(Default)]
 pub(crate) struct NowPlayingRenderer {
@@ -46,10 +47,7 @@ impl NowPlayingRenderer {
 
         let widget_width = region_width.min(MAX_WIDGET_WIDTH_PX);
         let x = right_edge - widget_width;
-        let bot = (height as f64) * 0.15;
-        let top = (height as f64) * 0.85;
-        let widget_height = top - bot;
-        let y = bot;
+        let (y, widget_height) = button_frame(height);
         let art = self.art_for(media.art_path.as_deref());
         let text_left = x
             + PADDING_PX
@@ -65,7 +63,7 @@ impl NowPlayingRenderer {
         }
 
         c.save().unwrap();
-        draw_round_rect(c, x, y, widget_width, widget_height, 8.0);
+        draw_round_rect(c, x, y, widget_width, widget_height, BUTTON_RADIUS_PX);
         c.set_source_rgb(BUTTON_BACKGROUND, BUTTON_BACKGROUND, BUTTON_BACKGROUND);
         c.fill().unwrap();
 
@@ -93,13 +91,13 @@ impl NowPlayingRenderer {
         } else {
             c.set_font_size(TITLE_FONT_SIZE);
             let title = ellipsize(c, &media.title, text_width);
-            c.move_to(text_left, y + 17.0);
+            c.move_to(text_left, y + (widget_height / 2.0 - 4.0).round());
             c.show_text(&title).unwrap();
 
             c.set_font_size(ARTIST_FONT_SIZE);
             c.set_source_rgb(0.78, 0.78, 0.78);
             let artist = ellipsize(c, &media.artist, text_width);
-            c.move_to(text_left, y + 32.0);
+            c.move_to(text_left, y + (widget_height / 2.0 + 13.0).round());
             c.show_text(&artist).unwrap();
         }
         c.restore().unwrap();
@@ -115,6 +113,12 @@ impl NowPlayingRenderer {
         }
         self.cached_art.as_ref()
     }
+}
+
+fn button_frame(height: i32) -> (f64, f64) {
+    let bot = (height as f64) * 0.15;
+    let top = (height as f64) * 0.85;
+    (bot - BUTTON_RADIUS_PX, top - bot + BUTTON_RADIUS_PX * 2.0)
 }
 
 fn draw_round_rect(c: &Context, x: f64, y: f64, width: f64, height: f64, radius: f64) {
@@ -229,6 +233,11 @@ mod tests {
             clip_for_span(60, 2008, 1990.0, 100.0),
             ClipRect::new(0, 1990, 60, 2008)
         );
+    }
+
+    #[test]
+    fn button_frame_matches_control_body_height() {
+        assert_eq!(button_frame(60), (1.0, 58.0));
     }
 
     #[test]
