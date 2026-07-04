@@ -23,6 +23,7 @@ const BUTTON_RADIUS_PX: f64 = 8.0;
 pub(crate) struct NowPlayingRenderer {
     cached_art_path: Option<String>,
     cached_art: Option<ImageSurface>,
+    last_bounds: Option<WidgetBounds>,
 }
 
 impl NowPlayingRenderer {
@@ -36,6 +37,7 @@ impl NowPlayingRenderer {
         media: Option<&NowPlaying>,
     ) -> Vec<ClipRect> {
         let (Some(media), Some((region_start, region_end))) = (media, region) else {
+            self.last_bounds = None;
             return Vec::new();
         };
         let right_edge = controls_origin
@@ -43,6 +45,7 @@ impl NowPlayingRenderer {
             .unwrap_or(region_end);
         let region_width = right_edge - region_start;
         if region_width < MIN_WIDGET_WIDTH_PX {
+            self.last_bounds = None;
             return Vec::new();
         }
 
@@ -50,6 +53,7 @@ impl NowPlayingRenderer {
         let measured_text_width = measure_text_width(c, media);
         let Some(widget_width) = widget_width_for(region_width, art.is_some(), measured_text_width)
         else {
+            self.last_bounds = None;
             return Vec::new();
         };
         let x = right_edge - widget_width;
@@ -64,6 +68,7 @@ impl NowPlayingRenderer {
         let text_right = x + widget_width - RIGHT_PADDING_PX;
         let text_width = text_right - text_left;
         if text_width < 24.0 {
+            self.last_bounds = None;
             return Vec::new();
         }
 
@@ -107,7 +112,12 @@ impl NowPlayingRenderer {
         }
         c.restore().unwrap();
 
+        self.last_bounds = Some(WidgetBounds::new(x, y, widget_width, widget_height));
         vec![clip_for_span(height, bar_width, x, widget_width)]
+    }
+
+    pub(crate) fn hit_test(&self, x: f64, y: f64) -> bool {
+        self.last_bounds.is_some_and(|bounds| bounds.contains(x, y))
     }
 
     fn art_for(&mut self, path: Option<&str>) -> Option<&ImageSurface> {
@@ -117,6 +127,29 @@ impl NowPlayingRenderer {
             self.cached_art = path.and_then(load_art);
         }
         self.cached_art.as_ref()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WidgetBounds {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+impl WidgetBounds {
+    fn new(left: f64, top: f64, width: f64, height: f64) -> WidgetBounds {
+        WidgetBounds {
+            left,
+            top,
+            right: left + width,
+            bottom: top + height,
+        }
+    }
+
+    fn contains(self, x: f64, y: f64) -> bool {
+        x >= self.left && x <= self.right && y >= self.top && y <= self.bottom
     }
 }
 
@@ -295,6 +328,17 @@ mod tests {
         );
         assert_eq!(widget_width_for(320.0, true, 900.0), Some(320.0));
         assert_eq!(widget_width_for(160.0, true, 90.0), None);
+    }
+
+    #[test]
+    fn widget_bounds_hit_test_includes_edges() {
+        let bounds = WidgetBounds::new(100.0, 1.0, 180.0, 58.0);
+
+        assert!(bounds.contains(100.0, 1.0));
+        assert!(bounds.contains(280.0, 59.0));
+        assert!(bounds.contains(180.0, 30.0));
+        assert!(!bounds.contains(99.9, 30.0));
+        assert!(!bounds.contains(180.0, 59.1));
     }
 
     #[test]

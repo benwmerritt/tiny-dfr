@@ -130,6 +130,21 @@ intent was added so taps can jump across monitors.
   volume latest-wins slot, so a tap can't be coalesced away by a concurrent
   drag. No acks: the resulting niri event → fresh `state` is the ack.
 
+`focus-now-playing`:
+
+```json
+{"t":"focus-now-playing"}
+```
+
+- Payload-free intent emitted only when a physical touch starts and releases
+  on the now-playing widget.
+- The helper resolves the currently playing MPRIS player with `playerctl`,
+  matches it to a live Niri window `app_id`, and focuses that window with
+  `niri msg action focus-window --id <id>`. Unknown or stale player/window
+  matches are logged and dropped.
+- This does not execute player-provided commands or URLs; the daemon never
+  receives a process id, command line, or arbitrary window id from state.
+
 ## Robustness rules
 
 - The daemon never crashes on socket input: parse errors, out-of-range or
@@ -154,10 +169,10 @@ intent was added so taps can jump across monitors.
 
 No brightness messages (daemon-local sysfs), no key or command execution, no
 config, no queries/RPC, and no media-control intents in v1. The intent set is
-exactly `{set-volume, focus-workspace}` — **typed, helper-validated, and
-originating only from physical touch**; state is render-input only and never
-triggers key emission, sysfs writes, MPRIS calls, network fetches, or
-execution. Anything not specified here is invalid.
+exactly `{set-volume, focus-workspace, focus-now-playing}` — **typed,
+helper-validated, and originating only from physical touch**; state is
+render-input only and never triggers key emission, sysfs writes, MPRIS calls,
+network fetches, or execution. Anything not specified here is invalid.
 
 Threat note: a process that can write this socket already runs as uid 1000
 and could call `wpctl`/`niri msg action` directly — the protocol grants

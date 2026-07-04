@@ -29,7 +29,7 @@ use nix::{
 use privdrop::PrivDrop;
 use std::{
     cmp::min,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     os::{
         fd::{AsFd, AsRawFd},
@@ -3016,6 +3016,7 @@ fn real_main(drm: &mut DrmBackend) {
 
     let mut digitizer: Option<InputDevice> = None;
     let mut touches = HashMap::new();
+    let mut now_playing_touches = HashSet::new();
     // Seed any sliders visible at startup (base-layer sliders would otherwise
     // render at 0.0 until the first overlay transition).
     for layer in layers.iter_mut() {
@@ -3040,6 +3041,7 @@ fn real_main(drm: &mut DrmBackend) {
             // Release in-flight touches against the outgoing layers before
             // they are dropped, or their key-down events would be stranded.
             drain_touches(&mut layers, &mut touches, &mut uinput);
+            now_playing_touches.clear();
             let parts = cfg_mgr.load_config(width);
             cfg = parts.0;
             layers = parts.1;
@@ -3322,6 +3324,7 @@ fn real_main(drm: &mut DrmBackend) {
                         };
                         if active_layer != new_layer {
                             drain_touches(&mut layers, &mut touches, &mut uinput);
+                            now_playing_touches.clear();
                             layers[active_layer].close_all_overlays();
                             active_layer = new_layer;
                             needs_complete_redraw = true;
@@ -3338,6 +3341,26 @@ fn real_main(drm: &mut DrmBackend) {
                         TouchEvent::Down(dn) => {
                             let x = dn.x_transformed(width as u32);
                             let y = dn.y_transformed(height as u32);
+                            if now_playing_renderer.hit_test(x, y) && now_playing.is_some() {
+                                if let Some((old_layer, old_set, old_btn)) =
+                                    touches.remove(&dn.seat_slot())
+                                {
+                                    if let Some(button) =
+                                        layers[old_layer].button_mut_in_set(&old_set, old_btn)
+                                    {
+                                        button.set_active(&mut uinput, false);
+                                        if let Some(state) = button.slider_state_mut() {
+                                            if state.dragging {
+                                                state.dragging = false;
+                                                button.changed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                now_playing_touches.insert(dn.seat_slot());
+                                continue;
+                            }
+                            now_playing_touches.remove(&dn.seat_slot());
                             match layers[active_layer].hit_target(width, height, x, y) {
                                 HitOutcome::Button(button_set, btn) => {
                                     // Workspace taps while an overlay is open
@@ -3423,6 +3446,7 @@ fn real_main(drm: &mut DrmBackend) {
                                 // release cannot activate anything.
                                 HitOutcome::OutsideControls => {
                                     drain_touches(&mut layers, &mut touches, &mut uinput);
+                                    now_playing_touches.clear();
                                     if layers[active_layer].close_all_overlays() {
                                         layers[active_layer].sync_sliders(
                                             &slider_backends,
@@ -3435,6 +3459,14 @@ fn real_main(drm: &mut DrmBackend) {
                             }
                         }
                         TouchEvent::Motion(mtn) => {
+                            if now_playing_touches.contains(&mtn.seat_slot()) {
+                                let x = mtn.x_transformed(width as u32);
+                                let y = mtn.y_transformed(height as u32);
+                                if !now_playing_renderer.hit_test(x, y) {
+                                    now_playing_touches.remove(&mtn.seat_slot());
+                                }
+                                continue;
+                            }
                             if !touches.contains_key(&mtn.seat_slot()) {
                                 continue;
                             }
@@ -3484,6 +3516,14 @@ fn real_main(drm: &mut DrmBackend) {
                             }
                         }
                         TouchEvent::Up(up) => {
+                            if now_playing_touches.remove(&up.seat_slot()) {
+                                if now_playing.is_some() {
+                                    if let Some(link) = helper_link.as_mut() {
+                                        link.send_intent(&epoll, &Intent::FocusNowPlaying);
+                                    }
+                                }
+                                continue;
+                            }
                             if !touches.contains_key(&up.seat_slot()) {
                                 continue;
                             }
@@ -3540,6 +3580,7 @@ fn real_main(drm: &mut DrmBackend) {
                         // A canceled touch must release its key and leave the
                         // map, exactly like Up, but never activates anything.
                         TouchEvent::Cancel(cancel) => {
+                            now_playing_touches.remove(&cancel.seat_slot());
                             if let Some((layer, button_set, btn)) =
                                 touches.remove(&cancel.seat_slot())
                             {

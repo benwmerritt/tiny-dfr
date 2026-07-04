@@ -166,6 +166,7 @@ fn clean_media_art_path(value: String) -> Option<String> {
 pub enum Intent {
     SetVolume(f64),
     FocusWorkspace(u64),
+    FocusNowPlaying,
 }
 
 pub fn encode_intent(intent: &Intent) -> String {
@@ -181,6 +182,7 @@ pub fn encode_intent(intent: &Intent) -> String {
         Intent::FocusWorkspace(id) => {
             format!("{{\"t\":\"focus-workspace\",\"id\":{id}}}\n")
         }
+        Intent::FocusNowPlaying => "{\"t\":\"focus-now-playing\"}\n".to_string(),
     }
 }
 
@@ -523,6 +525,10 @@ mod tests {
         assert_eq!(
             encode_intent(&Intent::FocusWorkspace(9)),
             "{\"t\":\"focus-workspace\",\"id\":9}\n"
+        );
+        assert_eq!(
+            encode_intent(&Intent::FocusNowPlaying),
+            "{\"t\":\"focus-now-playing\"}\n"
         );
     }
 
