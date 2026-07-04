@@ -52,7 +52,8 @@ intent was added so taps can jump across monitors.
                           {"id":9,"idx":2,"occ":true,"foc":true}]},
    {"name":"DP-3","ws":[{"id":3,"idx":1,"occ":true,"foc":false}]}
  ],
- "vol":{"level":0.60,"muted":false}}
+ "vol":{"level":0.60,"muted":false},
+ "media":{"title":"Song Name","artist":"Artist","art_path":"/tmp/tiny-dfr-ben/art-0123456789abcdef.png"}}
 ```
 
 - `outs` (array, required): one group per output, in a **stable,
@@ -80,6 +81,15 @@ intent was added so taps can jump across monitors.
   (receiver truncates to 64 chars, renders at most 6 critters). Strictly
   render-input: critters have no hit targets and can never trigger keys,
   sysfs writes, or intents. Absent → no critters.
+- `media` (object or absent): now-playing render input, present only while
+  something is actively playing. `title` is required after trimming; empty
+  title means no widget. `artist` is optional. Both strings are control-char
+  stripped and truncated by the daemon (`title` ≤ 96 chars, `artist` ≤ 80).
+  `art_path` is optional and must be a helper-prepared local PNG under
+  `/tmp/tiny-dfr-ben/` or `/run/tiny-dfr-ben/media/`; remote artwork URLs are
+  not valid daemon input. The daemon never fetches URLs, decodes embedded
+  image bytes, or follows arbitrary user-provided paths. Invalid/missing art
+  renders as text-only.
 - **Full snapshots only, no deltas**: any single message fully repairs the
   daemon's view after drops or reconnects.
 - Sent: (a) debounced (~40 ms) on any derived-state change, (b) every **2 s**
@@ -130,8 +140,8 @@ intent was added so taps can jump across monitors.
 - **Staleness**: state is stale when no client is connected or no valid
   `state` arrived for **6 s** (three missed heartbeats). Stale → the strip
   falls back to the static `[1]` button (plain `Alt+Num1` uinput keys, no
-  helper needed) and the volume slider goes inert. Freshness returning
-  restores the live strip.
+  helper needed), the now-playing widget hides, and the volume slider goes
+  inert. Freshness returning restores live render state.
 - **Echo-fight rule**: while a volume-slider touch is active, the daemon
   ignores incoming `vol` for rendering (the finger wins) and resumes tracking
   pushed state on touch-up.
@@ -143,11 +153,11 @@ intent was added so taps can jump across monitors.
 ## Explicit non-goals
 
 No brightness messages (daemon-local sysfs), no key or command execution, no
-config, no queries/RPC. The intent set is exactly
-`{set-volume, focus-workspace}` — **typed, helper-validated, and originating
-only from physical touch**; state is render-input only and never triggers
-key emission, sysfs writes, or execution. Anything not specified here is
-invalid.
+config, no queries/RPC, and no media-control intents in v1. The intent set is
+exactly `{set-volume, focus-workspace}` — **typed, helper-validated, and
+originating only from physical touch**; state is render-input only and never
+triggers key emission, sysfs writes, MPRIS calls, network fetches, or
+execution. Anything not specified here is invalid.
 
 Threat note: a process that can write this socket already runs as uid 1000
 and could call `wpctl`/`niri msg action` directly — the protocol grants

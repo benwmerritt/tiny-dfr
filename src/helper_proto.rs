@@ -12,6 +12,9 @@ pub const MAX_WS_PER_GROUP: usize = 16;
 pub const MAX_WS_IDX: u8 = 32;
 pub const MAX_CLAUDE_SESSIONS: usize = 8;
 pub const MAX_SESSION_ID_LEN: usize = 64;
+pub const MAX_MEDIA_TITLE_CHARS: usize = 96;
+pub const MAX_MEDIA_ARTIST_CHARS: usize = 80;
+pub const MAX_MEDIA_ART_PATH_CHARS: usize = 512;
 pub const SUPPORTED_VERSION: u64 = 1;
 const MAX_CONSECUTIVE_INVALID: u32 = 8;
 const MAX_MSGS_PER_WINDOW: u32 = 200;
@@ -35,6 +38,10 @@ pub struct StateMsg {
     // Pet-Claude presence: one critter per running Claude Code session.
     #[serde(default)]
     pub claude: Option<ClaudePresence>,
+    // Render-only now-playing metadata. The helper owns MPRIS/user-session
+    // access; the daemon only paints this when the helper state is fresh.
+    #[serde(default)]
+    pub media: Option<NowPlaying>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -47,6 +54,16 @@ pub struct ClaudePresence {
 pub struct ClaudeSession {
     #[serde(default)]
     pub id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct NowPlaying {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default)]
+    pub art_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -114,7 +131,36 @@ pub fn sanitize_state(mut state: StateMsg) -> StateMsg {
             }
         }
     }
+    if let Some(media) = &mut state.media {
+        media.title = clean_media_text(&media.title, MAX_MEDIA_TITLE_CHARS);
+        media.artist = clean_media_text(&media.artist, MAX_MEDIA_ARTIST_CHARS);
+        media.art_path = media.art_path.take().and_then(clean_media_art_path);
+        if media.title.is_empty() {
+            state.media = None;
+        }
+    }
     state
+}
+
+fn clean_media_text(value: &str, max_chars: usize) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(max_chars)
+        .collect()
+}
+
+fn clean_media_art_path(value: String) -> Option<String> {
+    let value = value.trim();
+    if value.len() > MAX_MEDIA_ART_PATH_CHARS
+        || !value.ends_with(".png")
+        || !(value.starts_with("/tmp/tiny-dfr-ben/")
+            || value.starts_with("/run/tiny-dfr-ben/media/"))
+    {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -259,6 +305,72 @@ mod tests {
     }
 
     #[test]
+    fn media_state_parses_and_sanitizes() {
+        let state = parse_line(
+            r#"{"t":"state","outs":[],"media":{"title":"  Song\u0007 Name  ","artist":"Artist","art_path":"/tmp/tiny-dfr-ben/current.png","future":true}}"#,
+        )
+        .unwrap();
+        let HelperMessage::State(state) = state else {
+            panic!("expected state");
+        };
+
+        let state = sanitize_state(state);
+        let media = state.media.unwrap();
+        assert_eq!(media.title, "Song Name");
+        assert_eq!(media.artist, "Artist");
+        assert_eq!(
+            media.art_path.as_deref(),
+            Some("/tmp/tiny-dfr-ben/current.png")
+        );
+    }
+
+    #[test]
+    fn media_sanitizer_drops_empty_titles_and_unsafe_art_paths() {
+        let state = sanitize_state(StateMsg {
+            outs: vec![],
+            vol: None,
+            claude: None,
+            media: Some(NowPlaying {
+                title: "   ".to_string(),
+                artist: "Artist".to_string(),
+                art_path: Some("/tmp/tiny-dfr-ben/current.png".to_string()),
+            }),
+        });
+        assert!(state.media.is_none());
+
+        let state = sanitize_state(StateMsg {
+            outs: vec![],
+            vol: None,
+            claude: None,
+            media: Some(NowPlaying {
+                title: "Track".to_string(),
+                artist: "Artist".to_string(),
+                art_path: Some("/home/ben/.cache/private.png".to_string()),
+            }),
+        });
+        assert_eq!(state.media.unwrap().art_path, None);
+    }
+
+    #[test]
+    fn media_sanitizer_truncates_text_fields() {
+        let state = sanitize_state(StateMsg {
+            outs: vec![],
+            vol: None,
+            claude: None,
+            media: Some(NowPlaying {
+                title: "t".repeat(MAX_MEDIA_TITLE_CHARS + 20),
+                artist: "a".repeat(MAX_MEDIA_ARTIST_CHARS + 20),
+                art_path: Some("/tmp/tiny-dfr-ben/current.jpg".to_string()),
+            }),
+        });
+
+        let media = state.media.unwrap();
+        assert_eq!(media.title.len(), MAX_MEDIA_TITLE_CHARS);
+        assert_eq!(media.artist.len(), MAX_MEDIA_ARTIST_CHARS);
+        assert_eq!(media.art_path, None);
+    }
+
+    #[test]
     fn sanitize_enforces_group_and_entry_bounds() {
         let groups = (0..6)
             .map(|g| OutputGroup {
@@ -277,6 +389,7 @@ mod tests {
             outs: groups,
             vol: None,
             claude: None,
+            media: None,
         });
 
         assert_eq!(state.outs.len(), MAX_GROUPS);
@@ -320,6 +433,7 @@ mod tests {
                 muted: false,
             }),
             claude: None,
+            media: None,
         });
 
         let ws = &state.outs[0].ws;
@@ -341,6 +455,7 @@ mod tests {
                     })
                     .collect(),
             }),
+            media: None,
         });
 
         let sessions = &state.claude.unwrap().sessions;
@@ -377,6 +492,7 @@ mod tests {
             ],
             vol: None,
             claude: None,
+            media: None,
         });
 
         assert_eq!(state.outs.len(), 1);

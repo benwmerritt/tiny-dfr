@@ -49,6 +49,7 @@ mod fonts;
 mod helper_link;
 mod helper_proto;
 mod layout;
+mod now_playing;
 mod pixel_shift;
 mod sliders;
 
@@ -58,11 +59,12 @@ use config::{ButtonConfig, Config, SliderTarget, WorkspacesCfg};
 use critters::CritterField;
 use display::DrmBackend;
 use helper_link::HelperLink;
-use helper_proto::{Intent, WsEntry};
+use helper_proto::{Intent, NowPlaying, WsEntry};
 use layout::{
     button_spans, controls_region, hit_in_spans, hit_index, strip_layout, ButtonSpan, LayoutSpec,
     RegionGeometry, CONTROL_SPACING_PX as BUTTON_SPACING_PX,
 };
+use now_playing::NowPlayingRenderer;
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 use sliders::SliderBackends;
 
@@ -3026,6 +3028,8 @@ fn real_main(drm: &mut DrmBackend) {
     let mut pending_strip_model: Option<Vec<Vec<WsEntry>>> = None;
     let mut last_structural_apply: Option<Instant> = None;
     let mut critter_field = CritterField::default();
+    let mut now_playing_renderer = NowPlayingRenderer::default();
+    let mut now_playing: Option<NowPlaying> = None;
     loop {
         if cfg_mgr.reload_pending() {
             // Release in-flight touches against the outgoing layers before
@@ -3102,6 +3106,11 @@ fn real_main(drm: &mut DrmBackend) {
                     Vec::new()
                 });
                 let volume = fresh.then(|| link.state().vol).flatten().map(|v| v.level);
+                let media = fresh.then(|| link.state().media.clone()).flatten();
+                if media != now_playing {
+                    now_playing = media;
+                    needs_complete_redraw = true;
+                }
                 // Pet-Claude census: one critter per session while fresh.
                 // Parked behind EnableCritters (default off) — the animation
                 // wedges the USB display; see .scratch/claude-critter/.
@@ -3175,8 +3184,10 @@ fn real_main(drm: &mut DrmBackend) {
         // region exists (Regions layer active), sessions are running, and
         // the bar is lit. Frames ride the epoll timeout like pixel shift.
         let critter_region = layers[active_layer].free_region(width as i32);
+        let now_playing_visible = now_playing.is_some() && critter_region.is_some();
         let critters_visible = cfg.enable_critters
             && critter_region.is_some()
+            && !now_playing_visible
             && !critter_field.is_empty()
             && backlight.current_bl() > 0;
         let mut critters_dirty = false;
@@ -3221,6 +3232,15 @@ fn real_main(drm: &mut DrmBackend) {
                 let c = Context::new(&surface).unwrap();
                 c.translate(height as f64, 0.0);
                 c.rotate((90.0f64).to_radians());
+                if complete {
+                    clips.extend(now_playing_renderer.render(
+                        &c,
+                        height as i32,
+                        width as i32,
+                        critter_region,
+                        now_playing.as_ref(),
+                    ));
+                }
                 clips.extend(critter_field.render(
                     &c,
                     height as i32,
@@ -3232,6 +3252,19 @@ fn real_main(drm: &mut DrmBackend) {
                     },
                     complete,
                 ));
+            } else {
+                let c = Context::new(&surface).unwrap();
+                c.translate(height as f64, 0.0);
+                c.rotate((90.0f64).to_radians());
+                if complete {
+                    clips.extend(now_playing_renderer.render(
+                        &c,
+                        height as i32,
+                        width as i32,
+                        critter_region,
+                        now_playing.as_ref(),
+                    ));
+                }
             }
             let data = surface.data().unwrap();
             drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
