@@ -10,7 +10,8 @@ const ART_SIZE_PX: i32 = 42;
 const MAX_ART_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WIDGET_WIDTH_PX: f64 = 440.0;
 const MIN_WIDGET_WIDTH_PX: f64 = 180.0;
-const PADDING_PX: f64 = 10.0;
+const LEFT_PADDING_PX: f64 = 10.0;
+const RIGHT_PADDING_PX: f64 = 14.0;
 const TEXT_GAP_PX: f64 = 12.0;
 const TITLE_FONT_SIZE: f64 = 19.0;
 const ARTIST_FONT_SIZE: f64 = 13.0;
@@ -54,13 +55,13 @@ impl NowPlayingRenderer {
         let x = right_edge - widget_width;
         let (y, widget_height) = button_frame(height);
         let text_left = x
-            + PADDING_PX
+            + LEFT_PADDING_PX
             + if art.is_some() {
                 ART_SIZE_PX as f64 + TEXT_GAP_PX
             } else {
                 0.0
             };
-        let text_right = x + widget_width - PADDING_PX;
+        let text_right = x + widget_width - RIGHT_PADDING_PX;
         let text_width = text_right - text_left;
         if text_width < 24.0 {
             return Vec::new();
@@ -72,7 +73,7 @@ impl NowPlayingRenderer {
         c.fill().unwrap();
 
         if let Some(art) = art {
-            let art_x = x + PADDING_PX;
+            let art_x = x + LEFT_PADDING_PX;
             let art_y = y + ((widget_height - ART_SIZE_PX as f64) / 2.0).round();
             c.save().unwrap();
             draw_round_rect(c, art_x, art_y, ART_SIZE_PX as f64, ART_SIZE_PX as f64, 7.0);
@@ -143,7 +144,8 @@ fn widget_width_for(region_width: f64, has_art: bool, measured_text_width: f64) 
         return None;
     }
     let max_widget_width = region_width.min(MAX_WIDGET_WIDTH_PX);
-    let non_text_width = PADDING_PX * 2.0
+    let non_text_width = LEFT_PADDING_PX
+        + RIGHT_PADDING_PX
         + if has_art {
             ART_SIZE_PX as f64 + TEXT_GAP_PX
         } else {
@@ -286,7 +288,7 @@ mod tests {
     #[test]
     fn widget_width_tracks_content_until_capped() {
         assert_eq!(widget_width_for(800.0, true, 90.0), Some(180.0));
-        assert_eq!(widget_width_for(800.0, true, 130.0), Some(204.0));
+        assert_eq!(widget_width_for(800.0, true, 130.0), Some(208.0));
         assert_eq!(
             widget_width_for(800.0, true, 900.0),
             Some(MAX_WIDGET_WIDTH_PX)
