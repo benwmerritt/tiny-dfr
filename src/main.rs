@@ -1400,6 +1400,11 @@ impl FunctionLayer {
         (end - start >= 80.0).then_some((start, end))
     }
 
+    fn visible_controls_origin(&self, bar_width: i32) -> Option<f64> {
+        (self.kind == LayerKind::Regions)
+            .then(|| self.controls_geometry(self.visible(), bar_width).origin)
+    }
+
     // Rebuild the strip from a helper model (empty = restore the static
     // fallback). PRECONDITION: the caller has drained ALL touches — the
     // generation bump below invalidates every in-flight strip entry, and a
@@ -3184,6 +3189,7 @@ fn real_main(drm: &mut DrmBackend) {
         // region exists (Regions layer active), sessions are running, and
         // the bar is lit. Frames ride the epoll timeout like pixel shift.
         let critter_region = layers[active_layer].free_region(width as i32);
+        let controls_origin = layers[active_layer].visible_controls_origin(width as i32);
         let now_playing_visible = now_playing.is_some() && critter_region.is_some();
         let critters_visible = cfg.enable_critters
             && critter_region.is_some()
@@ -3238,6 +3244,7 @@ fn real_main(drm: &mut DrmBackend) {
                         height as i32,
                         width as i32,
                         critter_region,
+                        controls_origin,
                         now_playing.as_ref(),
                     ));
                 }
@@ -3262,6 +3269,7 @@ fn real_main(drm: &mut DrmBackend) {
                         height as i32,
                         width as i32,
                         critter_region,
+                        controls_origin,
                         now_playing.as_ref(),
                     ));
                 }

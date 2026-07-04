@@ -87,9 +87,9 @@ intent was added so taps can jump across monitors.
   stripped and truncated by the daemon (`title` ≤ 96 chars, `artist` ≤ 80).
   `art_path` is optional and must be a helper-prepared local PNG under
   `/tmp/tiny-dfr-ben/` or `/run/tiny-dfr-ben/media/`; remote artwork URLs are
-  not valid daemon input. The daemon never fetches URLs, decodes embedded
-  image bytes, or follows arbitrary user-provided paths. Invalid/missing art
-  renders as text-only.
+  helper input only, never daemon input. The daemon never fetches URLs,
+  decodes embedded image bytes, or follows arbitrary user-provided paths.
+  Invalid/missing art renders as text-only.
 - **Full snapshots only, no deltas**: any single message fully repairs the
   daemon's view after drops or reconnects.
 - Sent: (a) debounced (~40 ms) on any derived-state change, (b) every **2 s**

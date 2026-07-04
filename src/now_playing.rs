@@ -6,14 +6,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const ART_SIZE_PX: i32 = 42;
+const ART_SIZE_PX: i32 = 36;
 const MAX_ART_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_WIDGET_WIDTH_PX: f64 = 640.0;
+const MAX_WIDGET_WIDTH_PX: f64 = 440.0;
 const MIN_WIDGET_WIDTH_PX: f64 = 180.0;
 const PADDING_PX: f64 = 10.0;
 const TEXT_GAP_PX: f64 = 12.0;
-const TITLE_FONT_SIZE: f64 = 22.0;
-const ARTIST_FONT_SIZE: f64 = 15.0;
+const TITLE_FONT_SIZE: f64 = 19.0;
+const ARTIST_FONT_SIZE: f64 = 13.0;
+const CONTROL_GAP_PX: f64 = 16.0;
+const BUTTON_BACKGROUND: f64 = 0.200;
 
 #[derive(Default)]
 pub(crate) struct NowPlayingRenderer {
@@ -28,19 +30,26 @@ impl NowPlayingRenderer {
         height: i32,
         bar_width: i32,
         region: Option<(f64, f64)>,
+        controls_origin: Option<f64>,
         media: Option<&NowPlaying>,
     ) -> Vec<ClipRect> {
         let (Some(media), Some((region_start, region_end))) = (media, region) else {
             return Vec::new();
         };
-        let region_width = region_end - region_start;
+        let right_edge = controls_origin
+            .map(|origin| (origin - CONTROL_GAP_PX).min(region_end))
+            .unwrap_or(region_end);
+        let region_width = right_edge - region_start;
         if region_width < MIN_WIDGET_WIDTH_PX {
             return Vec::new();
         }
 
         let widget_width = region_width.min(MAX_WIDGET_WIDTH_PX);
-        let x = region_start + ((region_width - widget_width) / 2.0).max(0.0);
-        let y = ((height - ART_SIZE_PX) as f64 / 2.0).round();
+        let x = right_edge - widget_width;
+        let bot = (height as f64) * 0.15;
+        let top = (height as f64) * 0.85;
+        let widget_height = top - bot;
+        let y = bot;
         let art = self.art_for(media.art_path.as_deref());
         let text_left = x
             + PADDING_PX
@@ -56,16 +65,17 @@ impl NowPlayingRenderer {
         }
 
         c.save().unwrap();
-        draw_round_rect(c, x, y, widget_width, ART_SIZE_PX as f64, 8.0);
-        c.set_source_rgb(0.08, 0.08, 0.08);
+        draw_round_rect(c, x, y, widget_width, widget_height, 8.0);
+        c.set_source_rgb(BUTTON_BACKGROUND, BUTTON_BACKGROUND, BUTTON_BACKGROUND);
         c.fill().unwrap();
 
         if let Some(art) = art {
             let art_x = x + PADDING_PX;
+            let art_y = y + ((widget_height - ART_SIZE_PX as f64) / 2.0).round();
             c.save().unwrap();
-            draw_round_rect(c, art_x, y, ART_SIZE_PX as f64, ART_SIZE_PX as f64, 7.0);
+            draw_round_rect(c, art_x, art_y, ART_SIZE_PX as f64, ART_SIZE_PX as f64, 7.0);
             c.clip();
-            c.set_source_surface(art, art_x, y).unwrap();
+            c.set_source_surface(art, art_x, art_y).unwrap();
             c.paint().unwrap();
             c.restore().unwrap();
         }
@@ -77,19 +87,19 @@ impl NowPlayingRenderer {
             let extents = c.text_extents(&title).unwrap();
             c.move_to(
                 text_left,
-                y + (ART_SIZE_PX as f64 / 2.0 + extents.height() / 2.0).round(),
+                y + (widget_height / 2.0 + extents.height() / 2.0).round(),
             );
             c.show_text(&title).unwrap();
         } else {
             c.set_font_size(TITLE_FONT_SIZE);
             let title = ellipsize(c, &media.title, text_width);
-            c.move_to(text_left, y + 19.0);
+            c.move_to(text_left, y + 17.0);
             c.show_text(&title).unwrap();
 
             c.set_font_size(ARTIST_FONT_SIZE);
             c.set_source_rgb(0.78, 0.78, 0.78);
             let artist = ellipsize(c, &media.artist, text_width);
-            c.move_to(text_left, y + 35.0);
+            c.move_to(text_left, y + 32.0);
             c.show_text(&artist).unwrap();
         }
         c.restore().unwrap();
