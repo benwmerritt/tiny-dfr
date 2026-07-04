@@ -45,10 +45,14 @@ impl NowPlayingRenderer {
             return Vec::new();
         }
 
-        let widget_width = region_width.min(MAX_WIDGET_WIDTH_PX);
+        let art = self.art_for(media.art_path.as_deref());
+        let measured_text_width = measure_text_width(c, media);
+        let Some(widget_width) = widget_width_for(region_width, art.is_some(), measured_text_width)
+        else {
+            return Vec::new();
+        };
         let x = right_edge - widget_width;
         let (y, widget_height) = button_frame(height);
-        let art = self.art_for(media.art_path.as_deref());
         let text_left = x
             + PADDING_PX
             + if art.is_some() {
@@ -113,6 +117,45 @@ impl NowPlayingRenderer {
         }
         self.cached_art.as_ref()
     }
+}
+
+fn measure_text_width(c: &Context, media: &NowPlaying) -> f64 {
+    c.save().unwrap();
+    c.set_font_size(TITLE_FONT_SIZE);
+    let title_width = c
+        .text_extents(&media.title)
+        .map(|ext| ext.width())
+        .unwrap_or(0.0);
+    let artist_width = if media.artist.is_empty() {
+        0.0
+    } else {
+        c.set_font_size(ARTIST_FONT_SIZE);
+        c.text_extents(&media.artist)
+            .map(|ext| ext.width())
+            .unwrap_or(0.0)
+    };
+    c.restore().unwrap();
+    title_width.max(artist_width)
+}
+
+fn widget_width_for(region_width: f64, has_art: bool, measured_text_width: f64) -> Option<f64> {
+    if region_width < MIN_WIDGET_WIDTH_PX {
+        return None;
+    }
+    let max_widget_width = region_width.min(MAX_WIDGET_WIDTH_PX);
+    let non_text_width = PADDING_PX * 2.0
+        + if has_art {
+            ART_SIZE_PX as f64 + TEXT_GAP_PX
+        } else {
+            0.0
+        };
+    let max_text_width = (max_widget_width - non_text_width).max(24.0);
+    let text_width = measured_text_width.max(24.0).min(max_text_width);
+    Some(
+        (non_text_width + text_width)
+            .ceil()
+            .clamp(MIN_WIDGET_WIDTH_PX, max_widget_width),
+    )
 }
 
 fn button_frame(height: i32) -> (f64, f64) {
@@ -238,6 +281,18 @@ mod tests {
     #[test]
     fn button_frame_matches_control_body_height() {
         assert_eq!(button_frame(60), (1.0, 58.0));
+    }
+
+    #[test]
+    fn widget_width_tracks_content_until_capped() {
+        assert_eq!(widget_width_for(800.0, true, 90.0), Some(180.0));
+        assert_eq!(widget_width_for(800.0, true, 130.0), Some(204.0));
+        assert_eq!(
+            widget_width_for(800.0, true, 900.0),
+            Some(MAX_WIDGET_WIDTH_PX)
+        );
+        assert_eq!(widget_width_for(320.0, true, 900.0), Some(320.0));
+        assert_eq!(widget_width_for(160.0, true, 90.0), None);
     }
 
     #[test]
