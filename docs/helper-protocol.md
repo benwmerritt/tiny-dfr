@@ -53,7 +53,7 @@ intent was added so taps can jump across monitors.
    {"name":"DP-3","ws":[{"id":3,"idx":1,"occ":true,"foc":false}]}
  ],
  "vol":{"level":0.60,"muted":false},
- "media":{"title":"Song Name","artist":"Artist","art_path":"/tmp/tiny-dfr-ben/art-0123456789abcdef.png"}}
+ "media":{"title":"Song Name","artist":"Artist","art_path":"/run/tiny-dfr-ben/media/art-0123456789abcdef.png"}}
 ```
 
 - `outs` (array, required): one group per output, in a **stable,
@@ -86,7 +86,7 @@ intent was added so taps can jump across monitors.
   title means no widget. `artist` is optional. Both strings are control-char
   stripped and truncated by the daemon (`title` ≤ 96 chars, `artist` ≤ 80).
   `art_path` is optional and must be a helper-prepared local PNG under
-  `/tmp/tiny-dfr-ben/` or `/run/tiny-dfr-ben/media/`; remote artwork URLs are
+  `/run/tiny-dfr-ben/media/`; remote artwork URLs are
   helper input only, never daemon input. The daemon never fetches URLs,
   decodes embedded image bytes, or follows arbitrary user-provided paths.
   Invalid/missing art renders as text-only.

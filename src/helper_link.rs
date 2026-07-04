@@ -8,12 +8,13 @@ use nix::sys::{
     socket::{getsockopt, sockopt::PeerCredentials},
 };
 use std::{
+    fs,
     io::{ErrorKind, Read, Write},
     os::unix::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
     },
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -33,6 +34,10 @@ pub struct HelperLink {
     allowed_uid: u32,
     state: StateMsg,
     last_state_at: Option<Instant>,
+}
+
+fn media_dir_for_socket(path: &Path) -> Option<PathBuf> {
+    path.parent().map(|dir| dir.join("media"))
 }
 
 struct Client {
@@ -118,6 +123,15 @@ impl HelperLink {
     // Must run before the privilege drop: only root can chown the socket to
     // the helper's uid inside the root-owned RuntimeDirectory.
     pub fn bind(path: &Path, allowed_uid: u32) -> Result<HelperLink> {
+        if let Some(media_dir) = media_dir_for_socket(path) {
+            fs::create_dir_all(&media_dir)
+                .with_context(|| format!("creating helper media dir at {}", media_dir.display()))?;
+            std::os::unix::fs::chown(&media_dir, Some(allowed_uid), None).with_context(|| {
+                format!("chowning {} to uid {allowed_uid}", media_dir.display())
+            })?;
+            fs::set_permissions(&media_dir, fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("chmoding helper media dir at {}", media_dir.display()))?;
+        }
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)
             .with_context(|| format!("binding helper socket at {}", path.display()))?;
@@ -372,6 +386,14 @@ mod tests {
         assert!(peer_allowed(0, 1000));
         assert!(!peer_allowed(1001, 1000));
         assert!(!peer_allowed(65534, 1000));
+    }
+
+    #[test]
+    fn media_dir_sits_next_to_helper_socket() {
+        assert_eq!(
+            media_dir_for_socket(Path::new("/run/tiny-dfr-ben/helper.sock")).as_deref(),
+            Some(Path::new("/run/tiny-dfr-ben/media"))
+        );
     }
 
     #[test]

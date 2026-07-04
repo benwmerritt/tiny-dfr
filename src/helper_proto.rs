@@ -155,8 +155,7 @@ fn clean_media_art_path(value: String) -> Option<String> {
     let value = value.trim();
     if value.len() > MAX_MEDIA_ART_PATH_CHARS
         || !value.ends_with(".png")
-        || !(value.starts_with("/tmp/tiny-dfr-ben/")
-            || value.starts_with("/run/tiny-dfr-ben/media/"))
+        || !value.starts_with("/run/tiny-dfr-ben/media/")
     {
         return None;
     }
@@ -307,7 +306,7 @@ mod tests {
     #[test]
     fn media_state_parses_and_sanitizes() {
         let state = parse_line(
-            r#"{"t":"state","outs":[],"media":{"title":"  Song\u0007 Name  ","artist":"Artist","art_path":"/tmp/tiny-dfr-ben/current.png","future":true}}"#,
+            r#"{"t":"state","outs":[],"media":{"title":"  Song\u0007 Name  ","artist":"Artist","art_path":"/run/tiny-dfr-ben/media/current.png","future":true}}"#,
         )
         .unwrap();
         let HelperMessage::State(state) = state else {
@@ -320,7 +319,7 @@ mod tests {
         assert_eq!(media.artist, "Artist");
         assert_eq!(
             media.art_path.as_deref(),
-            Some("/tmp/tiny-dfr-ben/current.png")
+            Some("/run/tiny-dfr-ben/media/current.png")
         );
     }
 
@@ -333,7 +332,7 @@ mod tests {
             media: Some(NowPlaying {
                 title: "   ".to_string(),
                 artist: "Artist".to_string(),
-                art_path: Some("/tmp/tiny-dfr-ben/current.png".to_string()),
+                art_path: Some("/run/tiny-dfr-ben/media/current.png".to_string()),
             }),
         });
         assert!(state.media.is_none());
@@ -349,6 +348,18 @@ mod tests {
             }),
         });
         assert_eq!(state.media.unwrap().art_path, None);
+
+        let state = sanitize_state(StateMsg {
+            outs: vec![],
+            vol: None,
+            claude: None,
+            media: Some(NowPlaying {
+                title: "Track".to_string(),
+                artist: "Artist".to_string(),
+                art_path: Some("/tmp/tiny-dfr-ben/current.png".to_string()),
+            }),
+        });
+        assert_eq!(state.media.unwrap().art_path, None);
     }
 
     #[test]
@@ -360,7 +371,7 @@ mod tests {
             media: Some(NowPlaying {
                 title: "t".repeat(MAX_MEDIA_TITLE_CHARS + 20),
                 artist: "a".repeat(MAX_MEDIA_ARTIST_CHARS + 20),
-                art_path: Some("/tmp/tiny-dfr-ben/current.jpg".to_string()),
+                art_path: Some("/run/tiny-dfr-ben/media/current.jpg".to_string()),
             }),
         });
 
