@@ -9,7 +9,17 @@ This fork experiments with a richer Touch Bar UX for Ben's Arch/T2 MacBook setup
 - Collapsed control groups on the right for brightness, keyboard/Touch Bar backlight, volume, and media.
 - Tap a group to reveal expanded controls.
 - Active Niri workspace highlighting through a safe state interface.
+- A Now Playing widget (track, artist, album art) in the middle region; tapping it focuses the player window.
 - No date, battery, time, or screenshot buttons in the preferred layout.
+
+## Current state
+
+The live strip, anchored overlay groups, sliders, and the Now Playing
+widget are all built and hardware-verified. Read the newest handoff in
+`handoff/` first (currently `2026-07-06-now-playing-widget.md`) — it holds
+the shipped-state summary, the appletbdrm USB-wedge post-mortem, and the
+recovery ladder. Protocol contract: `docs/helper-protocol.md`. Vocabulary:
+`CONTEXT.md`.
 
 ## Architecture direction
 

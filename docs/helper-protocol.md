@@ -89,7 +89,11 @@ intent was added so taps can jump across monitors.
   `/run/tiny-dfr-ben/media/`; remote artwork URLs are
   helper input only, never daemon input. The daemon never fetches URLs,
   decodes embedded image bytes, or follows arbitrary user-provided paths.
-  Invalid/missing art renders as text-only.
+  Invalid/missing art renders as text-only. Lifecycle note:
+  `/run/tiny-dfr-ben` is the daemon's systemd RuntimeDirectory, so the
+  media dir (and any prepared art) vanishes whenever the daemon is down
+  and is recreated (daemon-owned, chowned to HelperUid) on start — an
+  empty/missing art dir while the service is restarting is normal.
 - **Full snapshots only, no deltas**: any single message fully repairs the
   daemon's view after drops or reconnects.
 - Sent: (a) debounced (~40 ms) on any derived-state change, (b) every **2 s**

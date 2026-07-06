@@ -52,6 +52,18 @@ _Avoid_: command socket, RPC API, shell bridge
 The user-session companion that observes Niri workspace state and sends state updates to tiny-dfr.
 _Avoid_: Niri daemon, workspace script
 
+**Now Playing widget**:
+The middle-region Touch Bar widget showing the playing track's title, artist, and album art; tapping it asks the helper to focus the player window.
+_Avoid_: media widget, song display, MPRIS panel
+
+**USB wedge**:
+The appletbdrm failure where the Touch Bar's USB display channel stops responding (kernel `-110` errors); can strike with any damage traffic, not just critters.
+_Avoid_: display crash, DRM hang
+
+**Config-1 wedge**:
+The post-wedge state where the Touch Bar re-enumerates in USB configuration 1 (HID input only, no display interface); reboot is the only recovery, since config force-switching is forbidden on this machine.
+_Avoid_: HID mode, half-dead bar
+
 **Rollback**:
 Returning from `tiny-dfr-ben` to stock tiny-dfr while preserving a usable Touch Bar.
 _Avoid_: uninstall, revert everything

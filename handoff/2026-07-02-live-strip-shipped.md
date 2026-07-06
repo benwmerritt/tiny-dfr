@@ -2,6 +2,11 @@
 
 Date: 2026-07-02 (evening). Supersedes `2026-07-02-overlay-continuation-handoff.md`.
 
+> **Superseded as read-first by `2026-07-06-now-playing-widget.md`**
+> (now-playing widget, the 2026-07-06 USB wedge post-mortem, device-loss
+> crash fix, recovery-ladder amendments). Architecture and deploy sections
+> below still apply.
+
 ## What is live on hardware (all Ben-verified)
 
 The complete original project goal plus the field revisions:
