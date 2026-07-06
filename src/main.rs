@@ -37,6 +37,7 @@ use std::{
     },
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
+    process,
     time::{Duration, Instant},
 };
 use udev::MonitorBuilder;
@@ -2908,11 +2909,27 @@ where
 }
 
 fn main() {
-    let mut drm = DrmBackend::open_card().unwrap();
+    // No card yet is the normal boot race (niri briefly holds DRM master) or
+    // the post-wedge state (bar re-enumerated HID-only): exit quietly and let
+    // the service's patient restart keep trying, without a panic backtrace
+    // every 2s in the journal.
+    let mut drm = match DrmBackend::open_card() {
+        Ok(drm) => drm,
+        Err(err) => {
+            eprintln!("{err}");
+            process::exit(1);
+        }
+    };
     let (height, width) = drm.mode().size();
     let _ = panic::catch_unwind(AssertUnwindSafe(|| real_main(&mut drm)));
     let crash_bitmap = include_bytes!("crash_bitmap.raw");
-    let mut map = drm.map().unwrap();
+    // If real_main died because the touchbar's USB device vanished, the card
+    // is unwritable: there is nothing to show the crash bitmap on. Exit so
+    // systemd restarts us; the daemon reattaches when the bar re-enumerates.
+    let Ok(mut map) = drm.map() else {
+        eprintln!("touchbar DRM device is gone; exiting for service restart");
+        process::exit(1);
+    };
     let data = map.as_mut();
     let mut wptr = 0;
     for byte in crash_bitmap {
@@ -2927,7 +2944,10 @@ fn main() {
         }
     }
     drop(map);
-    drm.dirty(&[ClipRect::new(0, 0, height, width)]).unwrap();
+    if drm.dirty(&[ClipRect::new(0, 0, height, width)]).is_err() {
+        eprintln!("touchbar DRM device is gone; exiting for service restart");
+        process::exit(1);
+    }
     let mut sigset = SigSet::empty();
     sigset.add(Signal::SIGTERM);
     sigset.wait().unwrap();

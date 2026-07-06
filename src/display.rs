@@ -44,8 +44,11 @@ pub struct DrmBackend {
 
 impl Drop for DrmBackend {
     fn drop(&mut self) {
-        self.card.destroy_framebuffer(self.fb).unwrap();
-        self.card.destroy_dumb_buffer(self.db).unwrap();
+        // The card can vanish mid-run (appletbdrm USB wedge). This drop then
+        // runs during panic unwinding, and a second panic here aborts the
+        // whole process with a core dump instead of a clean restart.
+        let _ = self.card.destroy_framebuffer(self.fb);
+        let _ = self.card.destroy_dumb_buffer(self.db);
     }
 }
 
