@@ -74,15 +74,26 @@ unlucky timeout is unrecoverable regardless of cadence.
 Both are odds-lowering, not fixes. Documented as such so nobody mistakes the
 throttle for a cure.
 
-## The real fix (kernel-side, not done here)
+## The real fix (kernel-side) — implemented 2026-07-09
 
 A durable fix belongs in appletbdrm's flush path: on any `usb_bulk_msg` error,
-resynchronize before the next flush (`usb_clear_halt` both bulk endpoints, drain
-stale IN data, match responses by the timestamp the driver already sends so a
-late ack can be recognized and dropped), and propagate the error out of
-`atomic_update` so DIRTYFB returns non-zero and userspace finally gets real
-backpressure to back off on. That would turn today's permanent wedge into a
-recoverable hiccup.
+resynchronize before the next flush (`usb_clear_halt` a stalled endpoint, drain
+stale IN data) so a late ack can be discarded instead of desyncing the stream.
+That turns the permanent wedge into a recoverable hiccup.
+
+**This is now built and installed**, in a standalone repo at
+`~/dev/projects/appletbdrm-fix` (a patched out-of-tree build of the exact
+v7.0.12 driver + DKMS). It adds `appletbdrm_recover_endpoints()` — drain the
+stale/late IN-endpoint data (and `usb_clear_halt` a stalled endpoint) after any
+flush error so the next flush starts clean — plus a fix for a latent
+timestamp-mismatch that returned success. Endpoint draining turned out to be the
+load-bearing part; propagating the error to userspace is not reachable through
+the void `atomic_update` DRM API, and the resync makes it unnecessary. Validated
+on hardware 2026-07-09: every injected and one spontaneous `-110` recovered with
+the bar staying live. Installed via DKMS so it survives kernel updates. See that
+repo's README for the build/test/install and the kernel-update caveat (a future
+`linux-t2` DRM-API bump would need the patch refreshed; the failure is graceful,
+falling back to the stock module).
 
 ## References
 

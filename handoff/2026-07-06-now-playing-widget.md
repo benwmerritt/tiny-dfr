@@ -130,6 +130,15 @@ all?" Full write-up: **`docs/appletbdrm-wedge.md`**. Short version:
   (`MIN_FLUSH_INTERVAL`, ~30 Hz) that coalesces all redraws and collapses a
   slider drag's 100+/s per-event flush storm into ~30/s with the same tight
   damage. Applies to every redraw source, not just the parked critters.
+- **Actual cure since built (2026-07-09): a kernel-side driver fix**, in its
+  own repo at `~/dev/projects/appletbdrm-fix` (patched appletbdrm + DKMS). It
+  resynchronizes the USB endpoints after a failed flush so a `-110` recovers
+  instead of wedging permanently. Validated on hardware and DKMS-installed
+  (survives kernel updates). Details: `docs/appletbdrm-wedge.md`. With this in
+  place the wedge should no longer require a power-off; if the bar ever wedges
+  again, first check the fix is loaded (`cat
+  /sys/module/appletbdrm/parameters/recover` → 1; a stock module means a kernel
+  update dropped the DKMS build — rebuild per that repo's README).
 
 Diagnosis one-liners:
 
