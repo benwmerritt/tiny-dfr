@@ -672,13 +672,15 @@ impl Button {
         match &self.image {
             ButtonImage::Text(text) => {
                 let extents = c.text_extents(text).unwrap();
-                // Center the glyph ink, not the pen origin: subtract x_bearing
-                // so digits with an asymmetric left-side bearing (e.g. "1")
-                // don't sit off-center to the right.
+                // Center on the advance width (the glyph's cell), not the ink
+                // box. The label font is monospace (Adwaita Mono), which places
+                // each glyph within its fixed cell by design — e.g. "1" gets a
+                // wide right bearing so its stroke lands at the cell centre.
+                // Centering the ink box instead fights that and leaves "1"
+                // looking shifted; centering the cell honours the design.
                 c.move_to(
                     button_left_edge
-                        + (button_width as f64 / 2.0 - extents.width() / 2.0 - extents.x_bearing())
-                            .round(),
+                        + (button_width as f64 / 2.0 - extents.x_advance() / 2.0).round(),
                     y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round(),
                 );
                 c.show_text(text).unwrap();
