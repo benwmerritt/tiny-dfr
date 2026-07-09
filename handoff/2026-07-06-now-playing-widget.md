@@ -52,13 +52,14 @@ Symptom as experienced: "clicking the now-playing widget crashes the bar."
   unwraps during unwinding) → SIGABRT + core dump.
 - 10:59:47 — the bar re-enumerated in **USB config 1 (HID-only)**: input
   present, no DRM display interface. Config force-switching is forbidden
-  on this machine, so **reboot is the only recovery from config 1**
-  (`scripts/unwedge-touchbar.sh` detects and reports this case).
+  on this machine, so recovery needs a **full power-off** (see the
+  2026-07-09 note below — a warm reboot is NOT enough)
+  (`scripts/unwedge-touchbar.sh` detects and reports the config-1 case).
 - Aftermath: the service's patient restart (every 2s, never gives up)
   found no touchbar card and panicked with a full backtrace each try —
   15k+ journal entries over the day.
 
-## The fix (commit 4d851c7, built + tested, NOT yet deployed)
+## The fix (commit 4d851c7, deployed 2026-07-09)
 
 Device loss is now a clean exit instead of an abort:
 
@@ -68,19 +69,50 @@ Device loss is now a clean exit instead of an abort:
   one line and `exit(1)` for the service restart; a missing card at
   startup also exits with the probe error but no panic backtrace.
 
-Deploy: reboot first (to leave config 1), then `rtouchbar` (sudo,
-Ben-run). The installed binary until then still has the abort behavior.
+Deployed 2026-07-09 after the config-1 recovery below: `rtouchbar`
+installed the fixed binary, daemon came up clean (`helper connected
+(uid 1000)`, restart counter reset). Before that the installed binary
+still aborted on device loss.
 
 ## Amendments to the recovery ladder (2026-07-02 handoff §Recovery)
 
-Ladder unchanged, two clarifications:
+Ladder unchanged, three clarifications:
 
 1. The wedge is NOT critter-specific; it recurred with `EnableCritters`
    off. Any sustained damage traffic (or plain bad luck) can trigger it.
 2. If the device re-attaches in config 1 (check
    `cat /sys/bus/usb/devices/*/bConfigurationValue` for the 05ac:8302
    device, or just run `unwedge-touchbar` and read its verdict), skip
-   straight to reboot — deauth/reauth cannot restore the display config.
+   straight to a power-off — deauth/reauth cannot restore the display
+   config.
+3. **A warm reboot does NOT clear the config-1 wedge — only a full
+   power-off does** (learned 2026-07-09; see note below). The Touch Bar
+   lives on the T2 coprocessor, which keeps its hung USB state across a
+   `systemctl reboot`/restart. Once wedged, the T2 must actually lose
+   power.
+
+## 2026-07-09: the config-1 wedge that survived a reboot
+
+The bar stayed dead from the 2026-07-06 wedge across the whole next day.
+What we learned recovering it:
+
+- The device sat **unconfigured** on the bus (`bConfigurationValue`
+  empty), no `appletbdrm` card, no interfaces bound. The T2's USB stack
+  was hung at the protocol level: `unwedge-touchbar --force` deauth/reauth
+  produced `usb 5-6: can't set config #1, error -110` — the firmware
+  refused *any* set-config. (We did NOT force-switch the config; that's
+  forbidden and would just re-error / harden the wedge.)
+- A `systemctl reboot` did **not** fix it — same unconfigured state on the
+  next boot. The T2 retained the hang.
+- **A full power-off (shut down, ~30s off, cold boot) DID fix it**: the bar
+  came back with `card0 -> appletbdrm`, `card1 -> i915`, USB config 2. If a
+  plain power-off ever fails, the next rung is an SMC reset (shut down,
+  hold right-Shift + left-Control + left-Option 7s, add the power button
+  for another 7s, release, then boot).
+- After the card returned, `card0` briefly showed EBUSY — that was only the
+  old binary's 2s crash-loop fighting itself for DRM master (niri holds
+  card1/i915, never the Touch Bar). `rtouchbar` stops the service before
+  installing, so the clean install cleared it.
 
 Diagnosis one-liners:
 
