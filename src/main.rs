@@ -672,8 +672,13 @@ impl Button {
         match &self.image {
             ButtonImage::Text(text) => {
                 let extents = c.text_extents(text).unwrap();
+                // Center the glyph ink, not the pen origin: subtract x_bearing
+                // so digits with an asymmetric left-side bearing (e.g. "1")
+                // don't sit off-center to the right.
                 c.move_to(
-                    button_left_edge + (button_width as f64 / 2.0 - extents.width() / 2.0).round(),
+                    button_left_edge
+                        + (button_width as f64 / 2.0 - extents.width() / 2.0 - extents.x_bearing())
+                            .round(),
                     y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round(),
                 );
                 c.show_text(text).unwrap();
