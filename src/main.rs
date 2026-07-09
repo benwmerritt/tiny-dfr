@@ -84,6 +84,19 @@ const SLIDER_EMIT_INTERVAL: Duration = Duration::from_millis(50);
 // touches and forces a complete redraw); latest pending model wins. The real
 // helper debounces at 40ms, so this only bounds hostile/buggy senders.
 const STRIP_STRUCTURAL_MIN_INTERVAL: Duration = Duration::from_millis(100);
+// Minimum interval between DRM flushes to the Touch Bar display. Every flush is
+// a blocking ~1 s request/response USB handshake in appletbdrm; the wedge fires
+// when the T2 misses that deadline (kernel `-110`) and the driver never
+// resynchronizes, desyncing the stream permanently (recoverable only by USB
+// reset or power-off). This is a driver/firmware fault, NOT a userspace rate or
+// overlap bug (DIRTYFB is already serialized by the modeset locks, and the
+// ioctl returns 0 even on `-110`, so we get no backpressure signal). We cannot
+// prevent the wedge from here — but each flush is an independent dice-roll on
+// that timeout, so capping the flush rate cuts the number of round-trips a fast
+// slider drag would otherwise fire (one per libinput event) and lowers the
+// odds. Coalescing keeps per-flush damage tight (the other lever). ~30 Hz stays
+// smooth for sliders; see docs/appletbdrm-wedge.md for the full analysis.
+const MIN_FLUSH_INTERVAL: Duration = Duration::from_millis(33);
 
 // A horizontal pill (rounded-ends rectangle) path; caller fills.
 fn draw_pill(c: &Context, x: f64, y: f64, width: f64, height: f64) {
@@ -3065,6 +3078,7 @@ fn real_main(drm: &mut DrmBackend) {
     let mut helper_fresh = false;
     let mut pending_strip_model: Option<Vec<Vec<WsEntry>>> = None;
     let mut last_structural_apply: Option<Instant> = None;
+    let mut last_flush: Option<Instant> = None;
     let mut critter_field = CritterField::default();
     let mut now_playing_renderer = NowPlayingRenderer::default();
     let mut now_playing: Option<NowPlaying> = None;
@@ -3243,10 +3257,25 @@ fn real_main(drm: &mut DrmBackend) {
         }
 
         let layer_dirty = needs_complete_redraw || layers[active_layer].any_button_changed();
-        if layer_dirty
+        let want_redraw = layer_dirty
             || critters_dirty
-            || (cfg.enable_critters && !critters_visible && critter_field.needs_erase())
-        {
+            || (cfg.enable_critters && !critters_visible && critter_field.needs_erase());
+        // Rate-limit the flush to the display (see MIN_FLUSH_INTERVAL). When a
+        // redraw would come sooner than the interval after the last one, hold
+        // it: the pending damage is preserved for free because draw() has not
+        // consumed the button-changed flags and needs_complete_redraw is still
+        // set, so the next flush after the interval renders everything that
+        // changed meanwhile in a single dirty() ioctl — collapsing a burst of
+        // per-event flushes into one round-trip with the same tight damage.
+        let flush_now = Instant::now();
+        let flush_due = last_flush
+            .is_none_or(|at| flush_now.saturating_duration_since(at) >= MIN_FLUSH_INTERVAL);
+        if want_redraw && !flush_due {
+            let wait = MIN_FLUSH_INTERVAL
+                .saturating_sub(flush_now.saturating_duration_since(last_flush.unwrap()));
+            next_timeout_ms = min(next_timeout_ms, wait.as_millis().max(1) as i32);
+        }
+        if want_redraw && flush_due {
             let shift = if cfg.enable_pixel_shift {
                 pixel_shift.get()
             } else {
@@ -3311,6 +3340,7 @@ fn real_main(drm: &mut DrmBackend) {
             let data = surface.data().unwrap();
             drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
             drm.dirty(&clips).unwrap();
+            last_flush = Some(flush_now);
             needs_complete_redraw = false;
         }
 

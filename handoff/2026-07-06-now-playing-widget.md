@@ -114,6 +114,23 @@ What we learned recovering it:
   card1/i915, never the Touch Bar). `rtouchbar` stops the service before
   installing, so the clean install cleared it.
 
+## 2026-07-09: wedge root cause found + a flush throttle
+
+We read the appletbdrm driver source to answer "can we stop the wedge at
+all?" Full write-up: **`docs/appletbdrm-wedge.md`**. Short version:
+
+- The wedge is **not** a userspace rate or overlap bug. Every DRM flush is a
+  blocking ~1 s request/response USB handshake, already serialized by the
+  kernel. The T2 occasionally misses the deadline (`-110`), and the driver
+  **never resynchronizes**, so one late response desyncs the stream
+  permanently. It's a driver/firmware fault; the real fix is kernel-side.
+- The ioctl returns 0 even on `-110`, so there is **no backpressure** we can
+  detect. We can only lower the odds: fewer round-trips, tighter damage.
+- Shipped mitigation (not a cure): a global flush throttle in `src/main.rs`
+  (`MIN_FLUSH_INTERVAL`, ~30 Hz) that coalesces all redraws and collapses a
+  slider drag's 100+/s per-event flush storm into ~30/s with the same tight
+  damage. Applies to every redraw source, not just the parked critters.
+
 Diagnosis one-liners:
 
 ```sh
