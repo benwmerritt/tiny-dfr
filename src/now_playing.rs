@@ -1,13 +1,16 @@
-use crate::helper_proto::NowPlaying;
+use crate::helper_proto::{NowPlaying, MEDIA_ART_DIR};
 use cairo::{Antialias, Context, Format, ImageSurface};
 use drm::control::ClipRect;
 use std::{
-    fs::{self, File},
+    fs::{self, OpenOptions},
+    io::{Cursor, Read, Seek, SeekFrom},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
 const ART_SIZE_PX: i32 = 42;
 const MAX_ART_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_ART_DIMENSION_PX: u32 = 512;
 const MAX_WIDGET_WIDTH_PX: f64 = 440.0;
 const MIN_WIDGET_WIDTH_PX: f64 = 180.0;
 const LEFT_PADDING_PX: f64 = 10.0;
@@ -24,6 +27,14 @@ pub(crate) struct NowPlayingRenderer {
     cached_art_path: Option<String>,
     cached_art: Option<ImageSurface>,
     last_bounds: Option<WidgetBounds>,
+    bounds_generation: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct NowPlayingLayout {
+    pub(crate) region: Option<(f64, f64)>,
+    pub(crate) controls_origin: Option<f64>,
+    pub(crate) y_shift: f64,
 }
 
 impl NowPlayingRenderer {
@@ -32,35 +43,35 @@ impl NowPlayingRenderer {
         c: &Context,
         height: i32,
         bar_width: i32,
-        region: Option<(f64, f64)>,
-        controls_origin: Option<f64>,
+        layout: NowPlayingLayout,
         media: Option<&NowPlaying>,
     ) -> Vec<ClipRect> {
-        let (Some(media), Some((region_start, region_end))) = (media, region) else {
-            self.last_bounds = None;
+        let (Some(media), Some((region_start, region_end))) = (media, layout.region) else {
+            self.set_bounds(None);
             return Vec::new();
         };
-        let right_edge = controls_origin
+        let right_edge = layout
+            .controls_origin
             .map(|origin| (origin - CONTROL_GAP_PX).min(region_end))
             .unwrap_or(region_end);
         let region_width = right_edge - region_start;
         if region_width < MIN_WIDGET_WIDTH_PX {
-            self.last_bounds = None;
+            self.set_bounds(None);
             return Vec::new();
         }
 
-        let art = self.art_for(media.art_path.as_deref());
+        let has_art = self.art_for(media.art_path.as_deref()).is_some();
         let measured_text_width = measure_text_width(c, media);
-        let Some(widget_width) = widget_width_for(region_width, art.is_some(), measured_text_width)
+        let Some(widget_width) = widget_width_for(region_width, has_art, measured_text_width)
         else {
-            self.last_bounds = None;
+            self.set_bounds(None);
             return Vec::new();
         };
         let x = right_edge - widget_width;
-        let (y, widget_height) = button_frame(height);
+        let (y, widget_height) = button_frame(height, layout.y_shift);
         let text_left = x
             + LEFT_PADDING_PX
-            + if art.is_some() {
+            + if has_art {
                 ART_SIZE_PX as f64 + TEXT_GAP_PX
             } else {
                 0.0
@@ -68,7 +79,7 @@ impl NowPlayingRenderer {
         let text_right = x + widget_width - RIGHT_PADDING_PX;
         let text_width = text_right - text_left;
         if text_width < 24.0 {
-            self.last_bounds = None;
+            self.set_bounds(None);
             return Vec::new();
         }
 
@@ -77,7 +88,7 @@ impl NowPlayingRenderer {
         c.set_source_rgb(BUTTON_BACKGROUND, BUTTON_BACKGROUND, BUTTON_BACKGROUND);
         c.fill().unwrap();
 
-        if let Some(art) = art {
+        if let Some(art) = self.cached_art.as_ref() {
             let art_x = x + LEFT_PADDING_PX;
             let art_y = y + ((widget_height - ART_SIZE_PX as f64) / 2.0).round();
             c.save().unwrap();
@@ -112,12 +123,20 @@ impl NowPlayingRenderer {
         }
         c.restore().unwrap();
 
-        self.last_bounds = Some(WidgetBounds::new(x, y, widget_width, widget_height));
+        self.set_bounds(Some(WidgetBounds::new(x, y, widget_width, widget_height)));
         vec![clip_for_span(height, bar_width, x, widget_width)]
     }
 
     pub(crate) fn hit_test(&self, x: f64, y: f64) -> bool {
         self.last_bounds.is_some_and(|bounds| bounds.contains(x, y))
+    }
+
+    pub(crate) fn touch_token(&self, x: f64, y: f64) -> Option<u64> {
+        self.hit_test(x, y).then_some(self.bounds_generation)
+    }
+
+    pub(crate) fn token_is_current(&self, token: u64) -> bool {
+        self.last_bounds.is_some() && token == self.bounds_generation
     }
 
     fn art_for(&mut self, path: Option<&str>) -> Option<&ImageSurface> {
@@ -128,9 +147,21 @@ impl NowPlayingRenderer {
         }
         self.cached_art.as_ref()
     }
+
+    fn set_bounds(&mut self, bounds: Option<WidgetBounds>) {
+        let invalidates_touch = match (self.last_bounds, bounds) {
+            (None, None) => false,
+            (Some(old), Some(new)) => old.width() != new.width() || old.height() != new.height(),
+            _ => true,
+        };
+        self.last_bounds = bounds;
+        if invalidates_touch {
+            self.bounds_generation = self.bounds_generation.wrapping_add(1);
+        }
+    }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct WidgetBounds {
     left: f64,
     top: f64,
@@ -150,6 +181,14 @@ impl WidgetBounds {
 
     fn contains(self, x: f64, y: f64) -> bool {
         x >= self.left && x <= self.right && y >= self.top && y <= self.bottom
+    }
+
+    fn width(self) -> f64 {
+        self.right - self.left
+    }
+
+    fn height(self) -> f64 {
+        self.bottom - self.top
     }
 }
 
@@ -193,10 +232,13 @@ fn widget_width_for(region_width: f64, has_art: bool, measured_text_width: f64) 
     )
 }
 
-fn button_frame(height: i32) -> (f64, f64) {
+fn button_frame(height: i32, y_shift: f64) -> (f64, f64) {
     let bot = (height as f64) * 0.15;
     let top = (height as f64) * 0.85;
-    (bot - BUTTON_RADIUS_PX, top - bot + BUTTON_RADIUS_PX * 2.0)
+    (
+        bot - BUTTON_RADIUS_PX + y_shift,
+        top - bot + BUTTON_RADIUS_PX * 2.0,
+    )
 }
 
 fn draw_round_rect(c: &Context, x: f64, y: f64, width: f64, height: f64, radius: f64) {
@@ -244,12 +286,35 @@ fn clip_for_span(height: i32, bar_width: i32, left: f64, width: f64) -> ClipRect
 
 fn load_art(path: &str) -> Option<ImageSurface> {
     let path = safe_art_path(path)?;
-    if fs::metadata(&path).ok()?.len() > MAX_ART_BYTES {
+    // The helper owns the media directory, so validate the object actually
+    // opened rather than trusting path metadata. O_NONBLOCK prevents a FIFO
+    // from stalling the render/input loop; O_NOFOLLOW rejects a final-component
+    // symlink even if it is swapped in after the lexical path check.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(&path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_ART_BYTES {
         return None;
     }
-    let mut file = File::open(path).ok()?;
-    let surf = ImageSurface::create_from_png(&mut file).ok()?;
-    if surf.width() <= 0 || surf.height() <= 0 {
+    // The helper can still mutate an already-open inode. Snapshot through the
+    // verified descriptor with a hard read cap, then validate and decode only
+    // the immutable bytes so growth/rewrite races cannot bypass either bound.
+    let bytes = read_art_snapshot(file)?;
+    let mut image = Cursor::new(bytes);
+    // The compressed-byte cap does not stop a tiny PNG from declaring a huge
+    // decoded surface. Check IHDR before Cairo allocates for the image.
+    if !png_dimensions_are_safe(&mut image) {
+        return None;
+    }
+    let surf = ImageSurface::create_from_png(&mut image).ok()?;
+    if surf.width() <= 0
+        || surf.height() <= 0
+        || surf.width() as u32 > MAX_ART_DIMENSION_PX
+        || surf.height() as u32 > MAX_ART_DIMENSION_PX
+    {
         return None;
     }
 
@@ -270,25 +335,69 @@ fn load_art(path: &str) -> Option<ImageSurface> {
     Some(resized)
 }
 
+fn read_art_snapshot<R: Read>(reader: R) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_ART_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_ART_BYTES).then_some(bytes)
+}
+
+fn png_dimensions_are_safe<R: Read + Seek>(reader: &mut R) -> bool {
+    let mut header = [0u8; 24];
+    if reader.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    let read_ok = reader.read_exact(&mut header).is_ok();
+    let rewind_ok = reader.seek(SeekFrom::Start(0)).is_ok();
+    if !read_ok || !rewind_ok {
+        return false;
+    }
+    if &header[..8] != b"\x89PNG\r\n\x1a\n"
+        || u32::from_be_bytes(header[8..12].try_into().unwrap()) != 13
+        || &header[12..16] != b"IHDR"
+    {
+        return false;
+    }
+    let width = u32::from_be_bytes(header[16..20].try_into().unwrap());
+    let height = u32::from_be_bytes(header[20..24].try_into().unwrap());
+    width > 0 && height > 0 && width <= MAX_ART_DIMENSION_PX && height <= MAX_ART_DIMENSION_PX
+}
+
 fn safe_art_path(path: &str) -> Option<PathBuf> {
     let path = Path::new(path);
     if !path.is_absolute() || path.extension().and_then(|ext| ext.to_str()) != Some("png") {
         return None;
     }
-    let canonical = fs::canonicalize(path).ok()?;
-    if canonical.starts_with("/tmp/tiny-dfr-ben")
-        || canonical.starts_with("/run/tiny-dfr-ben/media")
-    {
-        Some(canonical)
-    } else {
-        None
+    if path.parent() != Some(Path::new(MEDIA_ART_DIR)) && !test_art_path_allowed(path) {
+        return None;
     }
+    if fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    Some(path.to_path_buf())
+}
+
+#[cfg(test)]
+fn test_art_path_allowed(path: &Path) -> bool {
+    path.starts_with("/tmp/tiny-dfr-ben")
+}
+
+#[cfg(not(test))]
+fn test_art_path_allowed(_path: &Path) -> bool {
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        ffi::CString,
+        io::Cursor,
+        os::unix::ffi::OsStrExt,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn unique_art_test_dir() -> PathBuf {
         let nanos = SystemTime::now()
@@ -315,7 +424,8 @@ mod tests {
 
     #[test]
     fn button_frame_matches_control_body_height() {
-        assert_eq!(button_frame(60), (1.0, 58.0));
+        assert_eq!(button_frame(60, 0.0), (1.0, 58.0));
+        assert_eq!(button_frame(60, 2.0), (3.0, 58.0));
     }
 
     #[test]
@@ -339,6 +449,75 @@ mod tests {
         assert!(bounds.contains(180.0, 30.0));
         assert!(!bounds.contains(99.9, 30.0));
         assert!(!bounds.contains(180.0, 59.1));
+    }
+
+    #[test]
+    fn bounds_generation_invalidates_an_in_flight_touch() {
+        let mut renderer = NowPlayingRenderer::default();
+        renderer.set_bounds(Some(WidgetBounds::new(100.0, 1.0, 180.0, 58.0)));
+        let token = renderer.touch_token(180.0, 30.0).unwrap();
+        assert!(renderer.token_is_current(token));
+
+        // Pixel shifting moves the same interactive shape and should not make
+        // ordinary presses fail merely because they span an animation tick.
+        renderer.set_bounds(Some(WidgetBounds::new(110.0, 3.0, 180.0, 58.0)));
+        assert!(renderer.token_is_current(token));
+        assert!(renderer.touch_token(180.0, 30.0).is_some());
+
+        // A content/geometry change or visibility change is semantic and must
+        // invalidate the bounds captured at Down.
+        renderer.set_bounds(Some(WidgetBounds::new(110.0, 3.0, 181.0, 58.0)));
+        assert!(!renderer.token_is_current(token));
+        let token = renderer.touch_token(180.0, 30.0).unwrap();
+        renderer.set_bounds(None);
+        assert!(!renderer.token_is_current(token));
+    }
+
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn png_dimensions_are_bounded_before_decode() {
+        assert!(png_dimensions_are_safe(&mut Cursor::new(png_header(
+            96, 96
+        ))));
+        assert!(!png_dimensions_are_safe(&mut Cursor::new(png_header(
+            0, 96
+        ))));
+        assert!(!png_dimensions_are_safe(&mut Cursor::new(png_header(
+            MAX_ART_DIMENSION_PX + 1,
+            1,
+        ))));
+        assert!(!png_dimensions_are_safe(&mut Cursor::new(
+            b"not png".to_vec()
+        )));
+    }
+
+    #[test]
+    fn art_loader_rejects_fifo_without_blocking() {
+        let dir = unique_art_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("cover.png");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c is a valid, NUL-terminated path owned by this test.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        assert!(load_art(fifo.to_str().unwrap()).is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn art_snapshot_enforces_the_compressed_byte_cap() {
+        assert_eq!(
+            read_art_snapshot(Cursor::new(vec![0u8; MAX_ART_BYTES as usize]))
+                .unwrap()
+                .len(),
+            MAX_ART_BYTES as usize
+        );
+        assert!(read_art_snapshot(Cursor::new(vec![0u8; MAX_ART_BYTES as usize + 1])).is_none());
     }
 
     #[test]

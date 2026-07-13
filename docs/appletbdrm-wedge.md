@@ -33,10 +33,11 @@ handshake**, not a fire-and-forget queue write:
 The trigger is the T2 side occasionally missing the 1 s deadline — transport /
 firmware fragility the driver can't prevent. What makes a transient timeout a
 **permanent** wedge is that appletbdrm does **nothing to resynchronize** after
-an error: no `usb_clear_halt`, no draining/discarding of a late response, no
-reset, and no matching of responses against the timestamp/msg id the protocol
-already carries. So a response that arrives after its deadline sits in the pipe;
-the next flush reads that stale data, desyncs, and the stream never recovers.
+an error: no `usb_clear_halt`, no draining/discarding of a late response, and no
+reset. The driver does compare response and request timestamps, but its mismatch
+branch only logs and still returns success. So a response that arrives after its
+deadline sits in the pipe; the next flush reads that stale data, desyncs, and
+the stream never recovers.
 
 Two consequences for userspace:
 

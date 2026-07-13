@@ -29,7 +29,7 @@ use nix::{
 use privdrop::PrivDrop;
 use std::{
     cmp::min,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     os::{
         fd::{AsFd, AsRawFd},
@@ -60,12 +60,12 @@ use config::{ButtonConfig, Config, SliderTarget, WorkspacesCfg};
 use critters::CritterField;
 use display::DrmBackend;
 use helper_link::HelperLink;
-use helper_proto::{Intent, NowPlaying, WsEntry};
+use helper_proto::{Intent, NowPlaying, WsEntry, HELPER_SOCKET_PATH};
 use layout::{
     button_spans, controls_region, hit_in_spans, hit_index, strip_layout, ButtonSpan, LayoutSpec,
     RegionGeometry, CONTROL_SPACING_PX as BUTTON_SPACING_PX,
 };
-use now_playing::NowPlayingRenderer;
+use now_playing::{NowPlayingLayout, NowPlayingRenderer};
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 use sliders::SliderBackends;
 
@@ -97,6 +97,39 @@ const STRIP_STRUCTURAL_MIN_INTERVAL: Duration = Duration::from_millis(100);
 // odds. Coalescing keeps per-flush damage tight (the other lever). ~30 Hz stays
 // smooth for sliders; see docs/appletbdrm-wedge.md for the full analysis.
 const MIN_FLUSH_INTERVAL: Duration = Duration::from_millis(33);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlushDecision {
+    Idle,
+    Wait(Duration),
+    Flush,
+}
+
+#[derive(Default)]
+struct FlushThrottle {
+    last_flush: Option<Instant>,
+}
+
+impl FlushThrottle {
+    fn decide(&self, redraw_pending: bool, now: Instant) -> FlushDecision {
+        if !redraw_pending {
+            return FlushDecision::Idle;
+        }
+        let Some(last_flush) = self.last_flush else {
+            return FlushDecision::Flush;
+        };
+        let elapsed = now.saturating_duration_since(last_flush);
+        if elapsed >= MIN_FLUSH_INTERVAL {
+            FlushDecision::Flush
+        } else {
+            FlushDecision::Wait(MIN_FLUSH_INTERVAL - elapsed)
+        }
+    }
+
+    fn record_flush(&mut self, now: Instant) {
+        self.last_flush = Some(now);
+    }
+}
 
 // A horizontal pill (rounded-ends rectangle) path; caller fills.
 fn draw_pill(c: &Context, x: f64, y: f64, width: f64, height: f64) {
@@ -2350,6 +2383,33 @@ OpenOverlay = "volume""#,
     }
 
     #[test]
+    fn display_flush_throttle_waits_for_the_boundary_and_keeps_pending_work() {
+        let mut throttle = FlushThrottle::default();
+        let t0 = Instant::now();
+
+        assert_eq!(throttle.decide(false, t0), FlushDecision::Idle);
+        assert_eq!(throttle.decide(true, t0), FlushDecision::Flush);
+        // Merely deciding to flush does not consume pending work. The caller
+        // records only after the DRM dirty ioctl has actually been issued.
+        assert_eq!(throttle.decide(true, t0), FlushDecision::Flush);
+        let completed_at = t0 + Duration::from_millis(100);
+        throttle.record_flush(completed_at);
+
+        assert_eq!(
+            throttle.decide(true, completed_at + Duration::from_millis(32)),
+            FlushDecision::Wait(Duration::from_millis(1))
+        );
+        assert_eq!(
+            throttle.decide(true, completed_at + MIN_FLUSH_INTERVAL),
+            FlushDecision::Flush
+        );
+        assert_eq!(
+            throttle.decide(false, completed_at + MIN_FLUSH_INTERVAL),
+            FlushDecision::Idle
+        );
+    }
+
+    #[test]
     fn throttle_keeps_pending_values_per_target() {
         let mut throttle = EmitThrottle::new();
         let t0 = Instant::now();
@@ -2814,23 +2874,47 @@ fn drain_touches<K, F>(
     K: Eq + std::hash::Hash,
     F: AsRawFd,
 {
-    for (_, (layer, set, btn)) in touches.drain() {
-        if let Some(button) = layers[layer].button_mut_in_set(&set, btn) {
-            button.set_active(uinput, false);
-            // An aborted drag must not leave `dragging` stranded true, or
-            // sync_sliders would refuse to re-seed this slider until the
-            // next completed drag on it.
-            if let Some(state) = button.slider_state_mut() {
-                if state.dragging {
-                    state.dragging = false;
-                    button.changed = true;
-                }
+    for (_, touch) in touches.drain() {
+        release_button_touch(layers, uinput, touch);
+    }
+}
+
+fn release_tracked_touch<K, F>(
+    layers: &mut [FunctionLayer; 2],
+    touches: &mut HashMap<K, (usize, ButtonSetKey, usize)>,
+    uinput: &mut UInputHandle<F>,
+    seat_slot: &K,
+) where
+    K: Eq + std::hash::Hash,
+    F: AsRawFd,
+{
+    if let Some(touch) = touches.remove(seat_slot) {
+        release_button_touch(layers, uinput, touch);
+    }
+}
+
+fn release_button_touch<F>(
+    layers: &mut [FunctionLayer; 2],
+    uinput: &mut UInputHandle<F>,
+    (layer, set, btn): (usize, ButtonSetKey, usize),
+) where
+    F: AsRawFd,
+{
+    if let Some(button) = layers[layer].button_mut_in_set(&set, btn) {
+        button.set_active(uinput, false);
+        // An aborted drag must not leave `dragging` stranded true, or
+        // sync_sliders would refuse to re-seed this slider until the next
+        // completed drag on it.
+        if let Some(state) = button.slider_state_mut() {
+            if state.dragging {
+                state.dragging = false;
+                button.changed = true;
             }
         }
-        // An unresolvable set here must only ever hold already-released
-        // entries: any path that makes a set unreachable (strip generation
-        // bump, config reload) is required to drain BEFORE the change.
     }
+    // An unresolvable set here must only ever hold already-released entries:
+    // any path that makes a set unreachable (strip generation bump, config
+    // reload) is required to drain BEFORE the change.
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2991,14 +3075,13 @@ fn real_main(drm: &mut DrmBackend) {
     // The helper socket also needs root (bind + chown inside the root-owned
     // RuntimeDirectory). Missing directory (e.g. stock unit without
     // RuntimeDirectory=) degrades to fallback-strip-only operation.
-    let mut helper_link =
-        match HelperLink::bind(Path::new("/run/tiny-dfr-ben/helper.sock"), cfg.helper_uid) {
-            Ok(link) => Some(link),
-            Err(e) => {
-                eprintln!("helper socket unavailable: {e:#}");
-                None
-            }
-        };
+    let mut helper_link = match HelperLink::bind(Path::new(HELPER_SOCKET_PATH), cfg.helper_uid) {
+        Ok(link) => Some(link),
+        Err(e) => {
+            eprintln!("helper socket unavailable: {e:#}");
+            None
+        }
+    };
 
     // drop privileges to input and video group
     let groups = ["input", "video"];
@@ -3068,7 +3151,7 @@ fn real_main(drm: &mut DrmBackend) {
 
     let mut digitizer: Option<InputDevice> = None;
     let mut touches = HashMap::new();
-    let mut now_playing_touches = HashSet::new();
+    let mut now_playing_touches: HashMap<u32, u64> = HashMap::new();
     // Seed any sliders visible at startup (base-layer sliders would otherwise
     // render at 0.0 until the first overlay transition).
     for layer in layers.iter_mut() {
@@ -3085,7 +3168,7 @@ fn real_main(drm: &mut DrmBackend) {
     let mut helper_fresh = false;
     let mut pending_strip_model: Option<Vec<Vec<WsEntry>>> = None;
     let mut last_structural_apply: Option<Instant> = None;
-    let mut last_flush: Option<Instant> = None;
+    let mut flush_throttle = FlushThrottle::default();
     let mut critter_field = CritterField::default();
     let mut now_playing_renderer = NowPlayingRenderer::default();
     let mut now_playing: Option<NowPlaying> = None;
@@ -3168,6 +3251,7 @@ fn real_main(drm: &mut DrmBackend) {
                 let volume = fresh.then(|| link.state().vol).flatten().map(|v| v.level);
                 let media = fresh.then(|| link.state().media.clone()).flatten();
                 if media != now_playing {
+                    now_playing_touches.clear();
                     now_playing = media;
                     needs_complete_redraw = true;
                 }
@@ -3214,6 +3298,7 @@ fn real_main(drm: &mut DrmBackend) {
             });
             if !structural || interval_elapsed {
                 if apply_helper_strip(&mut layers, &mut touches, &mut uinput, &model) {
+                    now_playing_touches.clear();
                     needs_complete_redraw = true;
                     last_structural_apply = Some(now);
                 }
@@ -3243,8 +3328,24 @@ fn real_main(drm: &mut DrmBackend) {
         // Advance the pet Claudes while they're visible: the free middle
         // region exists (Regions layer active), sessions are running, and
         // the bar is lit. Frames ride the epoll timeout like pixel shift.
-        let critter_region = layers[active_layer].free_region(width as i32);
-        let controls_origin = layers[active_layer].visible_controls_origin(width as i32);
+        let shift = if cfg.enable_pixel_shift {
+            pixel_shift.get()
+        } else {
+            (0.0, 0.0)
+        };
+        let pixel_shift_width = if cfg.enable_pixel_shift {
+            PIXEL_SHIFT_WIDTH_PX as i32
+        } else {
+            0
+        };
+        let effective_width = width as i32 - pixel_shift_width;
+        let x_offset = shift.0 + pixel_shift_width as f64 / 2.0;
+        let critter_region = layers[active_layer]
+            .free_region(effective_width)
+            .map(|(start, end)| (start + x_offset, end + x_offset));
+        let controls_origin = layers[active_layer]
+            .visible_controls_origin(effective_width)
+            .map(|origin| origin + x_offset);
         let now_playing_visible = now_playing.is_some() && critter_region.is_some();
         let critters_visible = cfg.enable_critters
             && critter_region.is_some()
@@ -3275,19 +3376,11 @@ fn real_main(drm: &mut DrmBackend) {
         // changed meanwhile in a single dirty() ioctl — collapsing a burst of
         // per-event flushes into one round-trip with the same tight damage.
         let flush_now = Instant::now();
-        let flush_due = last_flush
-            .is_none_or(|at| flush_now.saturating_duration_since(at) >= MIN_FLUSH_INTERVAL);
-        if want_redraw && !flush_due {
-            let wait = MIN_FLUSH_INTERVAL
-                .saturating_sub(flush_now.saturating_duration_since(last_flush.unwrap()));
+        let flush_decision = flush_throttle.decide(want_redraw, flush_now);
+        if let FlushDecision::Wait(wait) = flush_decision {
             next_timeout_ms = min(next_timeout_ms, wait.as_millis().max(1) as i32);
         }
-        if want_redraw && flush_due {
-            let shift = if cfg.enable_pixel_shift {
-                pixel_shift.get()
-            } else {
-                (0.0, 0.0)
-            };
+        if flush_decision == FlushDecision::Flush {
             let complete = needs_complete_redraw;
             let mut clips = if layer_dirty {
                 layers[active_layer].draw(
@@ -3301,23 +3394,27 @@ fn real_main(drm: &mut DrmBackend) {
             } else {
                 Vec::new()
             };
-            // Critters paint after the layer so they sit on the (empty)
-            // middle; render also erases last frame's spans. Gated off by
-            // default (EnableCritters) — see .scratch/claude-critter/.
-            if cfg.enable_critters {
-                let c = Context::new(&surface).unwrap();
-                c.translate(height as f64, 0.0);
-                c.rotate((90.0f64).to_radians());
-                if complete {
-                    clips.extend(now_playing_renderer.render(
-                        &c,
-                        height as i32,
-                        width as i32,
-                        critter_region,
+            let c = Context::new(&surface).unwrap();
+            c.translate(height as f64, 0.0);
+            c.rotate((90.0f64).to_radians());
+            if complete {
+                clips.extend(now_playing_renderer.render(
+                    &c,
+                    height as i32,
+                    width as i32,
+                    NowPlayingLayout {
+                        region: critter_region,
                         controls_origin,
-                        now_playing.as_ref(),
-                    ));
-                }
+                        y_shift: shift.1,
+                    },
+                    now_playing.as_ref(),
+                ));
+            }
+            // Critters paint after the layer and now-playing widget so they
+            // sit on the remaining middle; render also erases last frame's
+            // spans. Gated off by default (EnableCritters) — see
+            // .scratch/claude-critter/.
+            if cfg.enable_critters {
                 clips.extend(critter_field.render(
                     &c,
                     height as i32,
@@ -3329,25 +3426,11 @@ fn real_main(drm: &mut DrmBackend) {
                     },
                     complete,
                 ));
-            } else {
-                let c = Context::new(&surface).unwrap();
-                c.translate(height as f64, 0.0);
-                c.rotate((90.0f64).to_radians());
-                if complete {
-                    clips.extend(now_playing_renderer.render(
-                        &c,
-                        height as i32,
-                        width as i32,
-                        critter_region,
-                        controls_origin,
-                        now_playing.as_ref(),
-                    ));
-                }
             }
             let data = surface.data().unwrap();
             drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
             drm.dirty(&clips).unwrap();
-            last_flush = Some(flush_now);
+            flush_throttle.record_flush(Instant::now());
             needs_complete_redraw = false;
         }
 
@@ -3410,23 +3493,17 @@ fn real_main(drm: &mut DrmBackend) {
                         TouchEvent::Down(dn) => {
                             let x = dn.x_transformed(width as u32);
                             let y = dn.y_transformed(height as u32);
-                            if now_playing_renderer.hit_test(x, y) && now_playing.is_some() {
-                                if let Some((old_layer, old_set, old_btn)) =
-                                    touches.remove(&dn.seat_slot())
-                                {
-                                    if let Some(button) =
-                                        layers[old_layer].button_mut_in_set(&old_set, old_btn)
-                                    {
-                                        button.set_active(&mut uinput, false);
-                                        if let Some(state) = button.slider_state_mut() {
-                                            if state.dragging {
-                                                state.dragging = false;
-                                                button.changed = true;
-                                            }
-                                        }
-                                    }
-                                }
-                                now_playing_touches.insert(dn.seat_slot());
+                            let now_playing_token = now_playing
+                                .as_ref()
+                                .and_then(|_| now_playing_renderer.touch_token(x, y));
+                            if let Some(token) = now_playing_token {
+                                release_tracked_touch(
+                                    &mut layers,
+                                    &mut touches,
+                                    &mut uinput,
+                                    &dn.seat_slot(),
+                                );
+                                now_playing_touches.insert(dn.seat_slot(), token);
                                 continue;
                             }
                             now_playing_touches.remove(&dn.seat_slot());
@@ -3441,21 +3518,12 @@ fn real_main(drm: &mut DrmBackend) {
                                     // pairing, but don't let a duplicate Down
                                     // overwrite a live entry with its key
                                     // still down.
-                                    if let Some((old_layer, old_set, old_btn)) =
-                                        touches.remove(&dn.seat_slot())
-                                    {
-                                        if let Some(button) =
-                                            layers[old_layer].button_mut_in_set(&old_set, old_btn)
-                                        {
-                                            button.set_active(&mut uinput, false);
-                                            if let Some(state) = button.slider_state_mut() {
-                                                if state.dragging {
-                                                    state.dragging = false;
-                                                    button.changed = true;
-                                                }
-                                            }
-                                        }
-                                    }
+                                    release_tracked_touch(
+                                        &mut layers,
+                                        &mut touches,
+                                        &mut uinput,
+                                        &dn.seat_slot(),
+                                    );
                                     if let Some(target) =
                                         layers[active_layer].slider_target_at(&button_set, btn)
                                     {
@@ -3528,7 +3596,7 @@ fn real_main(drm: &mut DrmBackend) {
                             }
                         }
                         TouchEvent::Motion(mtn) => {
-                            if now_playing_touches.contains(&mtn.seat_slot()) {
+                            if now_playing_touches.contains_key(&mtn.seat_slot()) {
                                 let x = mtn.x_transformed(width as u32);
                                 let y = mtn.y_transformed(height as u32);
                                 if !now_playing_renderer.hit_test(x, y) {
@@ -3585,8 +3653,10 @@ fn real_main(drm: &mut DrmBackend) {
                             }
                         }
                         TouchEvent::Up(up) => {
-                            if now_playing_touches.remove(&up.seat_slot()) {
-                                if now_playing.is_some() {
+                            if let Some(token) = now_playing_touches.remove(&up.seat_slot()) {
+                                if now_playing.is_some()
+                                    && now_playing_renderer.token_is_current(token)
+                                {
                                     if let Some(link) = helper_link.as_mut() {
                                         link.send_intent(&epoll, &Intent::FocusNowPlaying);
                                     }
@@ -3637,6 +3707,7 @@ fn real_main(drm: &mut DrmBackend) {
                                         .map(|(left, _)| left);
                                     if layers[layer].activate_button_action(action, anchor) {
                                         drain_touches(&mut layers, &mut touches, &mut uinput);
+                                        now_playing_touches.clear();
                                         layers[layer].sync_sliders(
                                             &slider_backends,
                                             helper_volume(&helper_link, Instant::now()),

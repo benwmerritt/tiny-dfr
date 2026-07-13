@@ -1,6 +1,6 @@
-# Handoff: now-playing widget shipped + device-loss crash fix
+# Handoff: now-playing widget shipped + device-loss recovery
 
-Date: 2026-07-06. Supersedes `2026-07-02-live-strip-shipped.md` as the
+Date: 2026-07-09. Supersedes `2026-07-02-live-strip-shipped.md` as the
 read-first handoff (that doc's architecture/recovery sections still apply
 except where amended below).
 
@@ -21,8 +21,10 @@ critters used to own), between the workspace strip and the control groups:
   local file or http(s) fetch (2MB cap) → ffmpeg normalize to 96x96 PNG →
   content-addressed `art-<sha256/16>.png` in `/run/tiny-dfr-ben/media/`.
   The daemon creates that dir pre-privdrop and chowns it to HelperUid
-  (`src/helper_link.rs`); the daemon's loader re-validates path, root,
-  symlink escape, and size (`safe_art_path`). NOTE: `/run/tiny-dfr-ben` is
+  (`src/helper_link.rs`); the daemon's loader re-validates the direct-child
+  path, rejects symlinks/non-regular files without blocking, and bounds both
+  compressed size and decoded dimensions (`safe_art_path`). NOTE:
+  `/run/tiny-dfr-ben` is
   a systemd RuntimeDirectory — it vanishes whenever the daemon is down, so
   "no art files" while the service is crash-looping is normal, not a bug.
 - **Tap-to-focus**: tapping the widget sends a `focus-now-playing` intent;
@@ -33,7 +35,7 @@ critters used to own), between the workspace strip and the control groups:
 Commits: 834b9d9 (render) → cd8d02a, ce114ef, 1628dc3, 886f698, 8268908
 (art sharing, alignment, frame, sizing, padding) → 90c4e82 (tap-to-focus)
 → 3a9a53f (hide under overlays) → 4d851c7 (device-loss fix, below).
-Daemon tests: 105 (`cargo test`; pre-commit hook runs the full gates).
+Daemon tests: 112 (`cargo test`; pre-commit hook runs the full gates).
 
 ## The 2026-07-06 incident (why the bar is/was dead)
 
@@ -135,8 +137,10 @@ all?" Full write-up: **`docs/appletbdrm-wedge.md`**. Short version:
   resynchronizes the USB endpoints after a failed flush so a `-110` recovers
   instead of wedging permanently. Validated on hardware and DKMS-installed
   (survives kernel updates). Details: `docs/appletbdrm-wedge.md`. With this in
-  place the wedge should no longer require a power-off; if the bar ever wedges
-  again, first check the fix is loaded (`cat
+  place a normal display-channel timeout should recover while the device
+  remains display-capable. A config-1 or unconfigured re-enumeration still
+  requires the power-off/SMC-reset ladder above. If the bar ever wedges again,
+  first check the fix is loaded (`cat
   /sys/module/appletbdrm/parameters/recover` → 1; a stock module means a kernel
   update dropped the DKMS build — rebuild per that repo's README).
 

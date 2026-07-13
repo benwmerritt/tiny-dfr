@@ -61,7 +61,7 @@ The appletbdrm failure where the Touch Bar's USB display channel stops respondin
 _Avoid_: display crash, DRM hang
 
 **Config-1 wedge**:
-The post-wedge state where the Touch Bar re-enumerates in USB configuration 1 (HID input only, no display interface) or stuck unconfigured; a full power-off is the only recovery (a warm reboot does not clear it — the T2 keeps the hang), since config force-switching is forbidden on this machine.
+The post-wedge state where the Touch Bar re-enumerates in USB configuration 1 (HID input only, no display interface) or stays unconfigured; a full power-off is the first reliable recovery (a warm reboot does not clear it because the T2 keeps the hang), with an SMC reset as the next rung if a plain power-off fails. Config force-switching remains forbidden on this machine.
 _Avoid_: HID mode, half-dead bar
 
 **Rollback**:

@@ -376,7 +376,7 @@ mod tests {
                 .disconnect
         );
 
-        let big = vec![b'x'; 5000];
+        let big = vec![b'x'; crate::helper_proto::MAX_LINE_BYTES + 1];
         assert!(client.ingest(&big, now).disconnect);
     }
 

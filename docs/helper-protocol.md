@@ -22,8 +22,10 @@ intent was added so taps can jump across monitors.
 ## Framing
 
 - NDJSON: one JSON object per line, UTF-8, `\n`-terminated.
-- **Max 4096 bytes per line.** Receiver treats an overlong line as a protocol
-  error (a legitimate `state` is comfortably under 1 KiB).
+- **Max 16384 bytes per line.** Receiver treats an overlong line as a protocol
+  error. The cap accommodates a snapshot at every documented field/count bound
+  while keeping buffering strictly limited; normal helper snapshots are much
+  smaller.
 - **Must-ignore rule**: unknown *fields* in a known message are silently
   ignored (the forward-compatibility seam — e.g. a future
   `"claude": {"on": true}` presence field rides `state` with no version
@@ -85,11 +87,13 @@ intent was added so taps can jump across monitors.
   something is actively playing. `title` is required after trimming; empty
   title means no widget. `artist` is optional. Both strings are control-char
   stripped and truncated by the daemon (`title` ≤ 96 chars, `artist` ≤ 80).
-  `art_path` is optional and must be a helper-prepared local PNG under
-  `/run/tiny-dfr-ben/media/`; remote artwork URLs are
+  `art_path` is optional and must be a direct-child, helper-prepared local PNG
+  under `/run/tiny-dfr-ben/media/`; remote artwork URLs are
   helper input only, never daemon input. The daemon never fetches URLs,
   decodes embedded image bytes, or follows arbitrary user-provided paths.
-  Invalid/missing art renders as text-only. Lifecycle note:
+  The daemon opens art nonblocking without following symlinks, accepts only
+  regular files ≤ 2 MiB with dimensions ≤ 512×512, and renders invalid/missing
+  art as text-only. Lifecycle note:
   `/run/tiny-dfr-ben` is the daemon's systemd RuntimeDirectory, so the
   media dir (and any prepared art) vanishes whenever the daemon is down
   and is recreated (daemon-owned, chowned to HelperUid) on start — an

@@ -16,7 +16,7 @@ This fork experiments with a richer Touch Bar UX for Ben's Arch/T2 MacBook setup
 
 The live strip, anchored overlay groups, sliders, and the Now Playing
 widget are all built and hardware-verified. Read the newest handoff in
-`handoff/` first (currently `2026-07-06-now-playing-widget.md`) — it holds
+`handoff/` first (currently `2026-07-09-now-playing-widget.md`) — it holds
 the shipped-state summary, the appletbdrm USB-wedge post-mortem, and the
 recovery ladder. Protocol contract: `docs/helper-protocol.md`. Vocabulary:
 `CONTEXT.md`.
