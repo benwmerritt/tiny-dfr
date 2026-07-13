@@ -17,11 +17,16 @@ EOF
   exit 1
 fi
 
-systemd_version="$(systemctl --version | awk 'NR == 1 { print $2 }')"
-if [[ ! "$systemd_version" =~ ^[0-9]+$ ]] || (( systemd_version < 254 )); then
+manager_version="$(systemctl show --property=Version --value 2>/dev/null || true)"
+if [[ "$manager_version" =~ ^([0-9]+)([^0-9].*)?$ ]]; then
+  systemd_version="${BASH_REMATCH[1]}"
+else
+  systemd_version=""
+fi
+if [[ -z "$systemd_version" ]] || (( systemd_version < 254 )); then
   cat >&2 <<EOF
 tiny-dfr-ben requires systemd 254 or newer for bounded restart backoff
-(RestartSteps= and RestartMaxDelaySec=). Found: ${systemd_version:-unknown}.
+(RestartSteps= and RestartMaxDelaySec=). Running manager: ${manager_version:-unknown}.
 Refusing to install a unit that could fall back to a 2-second restart loop.
 EOF
   exit 1
@@ -122,6 +127,12 @@ StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/local/bin/tiny-dfr-ben
+# Treat ten seconds of uninterrupted runtime as healthy. The PID check keeps
+# an early exit from reaching the reset; a healthy run returns the service
+# restart counter to RestartSec.
+ExecStartPost=/usr/bin/sleep 10
+ExecStartPost=/usr/bin/kill -0 $MAINPID
+ExecStartPost=/usr/bin/systemctl reset-failed tiny-dfr-ben.service
 Restart=always
 # Retry promptly for the normal boot race, then exponentially back off to five
 # minutes for a persistent config-1/unconfigured device or program failure.

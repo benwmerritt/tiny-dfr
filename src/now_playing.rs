@@ -6,6 +6,7 @@ use std::{
     io::{Cursor, Read, Seek, SeekFrom},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 const ART_SIZE_PX: i32 = 42;
@@ -21,11 +22,13 @@ const ARTIST_FONT_SIZE: f64 = 13.0;
 const CONTROL_GAP_PX: f64 = 16.0;
 const BUTTON_BACKGROUND: f64 = 0.200;
 const BUTTON_RADIUS_PX: f64 = 8.0;
+const ART_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub(crate) struct NowPlayingRenderer {
     cached_art_media: Option<NowPlaying>,
     cached_art: Option<ImageSurface>,
+    art_retry_at: Option<Instant>,
     last_bounds: Option<WidgetBounds>,
     bounds_generation: u64,
 }
@@ -140,16 +143,36 @@ impl NowPlayingRenderer {
     }
 
     fn art_for(&mut self, media: &NowPlaying) -> Option<&ImageSurface> {
-        if self.art_cache_needs_reload(media) {
+        let now = Instant::now();
+        if self.art_cache_needs_reload(media, now) {
             self.cached_art_media = Some(media.clone());
             self.cached_art = media.art_path.as_deref().and_then(load_art);
+            self.art_retry_at = (media.art_path.is_some() && self.cached_art.is_none())
+                .then_some(now + ART_RETRY_INTERVAL);
         }
         self.cached_art.as_ref()
     }
 
-    fn art_cache_needs_reload(&self, media: &NowPlaying) -> bool {
+    fn art_cache_needs_reload(&self, media: &NowPlaying, now: Instant) -> bool {
         self.cached_art_media.as_ref() != Some(media)
-            || (media.art_path.is_some() && self.cached_art.is_none())
+            || self.art_retry_at.is_some_and(|retry_at| now >= retry_at)
+    }
+
+    pub(crate) fn art_retry_wait(
+        &self,
+        media: Option<&NowPlaying>,
+        now: Instant,
+    ) -> Option<Duration> {
+        let media = media?;
+        if self.last_bounds.is_none()
+            || self.cached_art_media.as_ref() != Some(media)
+            || self.cached_art.is_some()
+            || media.art_path.is_none()
+        {
+            return None;
+        }
+        self.art_retry_at
+            .map(|retry_at| retry_at.saturating_duration_since(now))
     }
 
     fn set_bounds(&mut self, bounds: Option<WidgetBounds>) {
@@ -478,7 +501,8 @@ mod tests {
     }
 
     #[test]
-    fn art_cache_reloads_when_media_changes_at_a_stable_path() {
+    fn art_cache_reloads_on_media_change_and_throttles_failures() {
+        let now = Instant::now();
         let path = Some("/run/tiny-dfr-ben/media/current.png".to_string());
         let first = NowPlaying {
             title: "First track".to_string(),
@@ -493,13 +517,25 @@ mod tests {
         let mut renderer = NowPlayingRenderer {
             cached_art_media: Some(first.clone()),
             cached_art: Some(ImageSurface::create(Format::ARgb32, 1, 1).unwrap()),
+            last_bounds: Some(WidgetBounds::new(100.0, 1.0, 180.0, 58.0)),
             ..Default::default()
         };
 
-        assert!(!renderer.art_cache_needs_reload(&first));
-        assert!(renderer.art_cache_needs_reload(&second));
+        assert!(!renderer.art_cache_needs_reload(&first, now));
+        assert!(renderer.art_cache_needs_reload(&second, now));
         renderer.cached_art = None;
-        assert!(renderer.art_cache_needs_reload(&first));
+        renderer.art_retry_at = Some(now + ART_RETRY_INTERVAL);
+        assert!(!renderer.art_cache_needs_reload(&first, now));
+        assert_eq!(
+            renderer.art_retry_wait(Some(&first), now),
+            Some(ART_RETRY_INTERVAL)
+        );
+        assert!(renderer.art_cache_needs_reload(&first, now + ART_RETRY_INTERVAL));
+        renderer.last_bounds = None;
+        assert_eq!(
+            renderer.art_retry_wait(Some(&first), now + ART_RETRY_INTERVAL),
+            None
+        );
     }
 
     fn png_header(width: u32, height: u32) -> Vec<u8> {

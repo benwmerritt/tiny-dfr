@@ -3347,6 +3347,17 @@ fn real_main(drm: &mut DrmBackend) {
             .visible_controls_origin(effective_width)
             .map(|origin| origin + x_offset);
         let now_playing_visible = now_playing.is_some() && critter_region.is_some();
+        if now_playing_visible {
+            if let Some(wait) =
+                now_playing_renderer.art_retry_wait(now_playing.as_ref(), Instant::now())
+            {
+                if wait.is_zero() {
+                    needs_complete_redraw = true;
+                } else {
+                    next_timeout_ms = min(next_timeout_ms, wait.as_millis().max(1) as i32);
+                }
+            }
+        }
         let critters_visible = cfg.enable_critters
             && critter_region.is_some()
             && !now_playing_visible

@@ -96,8 +96,10 @@ intent was added so taps can jump across monitors.
   art as text-only. Lifecycle note:
   `/run/tiny-dfr-ben` is the daemon's systemd RuntimeDirectory, so the
   media dir (and any prepared art) vanishes whenever the daemon is down
-  and is recreated (daemon-owned, chowned to HelperUid) on start — an
-  empty/missing art dir while the service is restarting is normal.
+  and is recreated by the daemon on start. After creation, the media
+  subdirectory's Unix owner is `HelperUid`; "daemon-managed" refers only to
+  its creation and RuntimeDirectory-bound lifecycle. An empty/missing art dir
+  while the service is restarting is normal.
 - **Full snapshots only, no deltas**: any single message fully repairs the
   daemon's view after drops or reconnects.
 - Sent: (a) debounced (~40 ms) on any derived-state change, (b) every **2 s**
