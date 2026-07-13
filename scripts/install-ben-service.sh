@@ -17,6 +17,16 @@ EOF
   exit 1
 fi
 
+systemd_version="$(systemctl --version | awk 'NR == 1 { print $2 }')"
+if [[ ! "$systemd_version" =~ ^[0-9]+$ ]] || (( systemd_version < 254 )); then
+  cat >&2 <<EOF
+tiny-dfr-ben requires systemd 254 or newer for bounded restart backoff
+(RestartSteps= and RestartMaxDelaySec=). Found: ${systemd_version:-unknown}.
+Refusing to install a unit that could fall back to a 2-second restart loop.
+EOF
+  exit 1
+fi
+
 repo_root="${TINY_DFR_FORK_DIR:-/home/ben/dev/projects/tiny-dfr}"
 archdots_root="${ARCHDOTS_DIR:-/home/ben/archdots}"
 # TINY_DFR_BINARY overrides which build gets installed (used by

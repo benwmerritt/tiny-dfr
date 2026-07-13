@@ -157,7 +157,7 @@ intent was added so taps can jump across monitors.
 
 - The daemon never crashes on socket input: parse errors, out-of-range or
   non-finite numbers, and oversize lines are dropped and counted. After **8
-  consecutive** invalid lines, any line > 4096 bytes, or > **200 msg/s**
+  consecutive** invalid lines, any line > 16384 bytes, or > **200 msg/s**
   sustained over 1 s, the daemon closes the connection. The counter resets on
   any valid message.
 - **Staleness**: state is stale when no client is connected or no valid

@@ -75,15 +75,15 @@ unlucky timeout is unrecoverable regardless of cadence.
 Both are odds-lowering, not fixes. Documented as such so nobody mistakes the
 throttle for a cure.
 
-## The real fix (kernel-side) — implemented 2026-07-09
+## Ben-host kernel fix — implemented 2026-07-09
 
 A durable fix belongs in appletbdrm's flush path: on any `usb_bulk_msg` error,
 resynchronize before the next flush (`usb_clear_halt` a stalled endpoint, drain
 stale IN data) so a late ack can be discarded instead of desyncing the stream.
 That turns the permanent wedge into a recoverable hiccup.
 
-**This is now built and installed**, in a standalone repo at
-`~/dev/projects/appletbdrm-fix` (a patched out-of-tree build of the exact
+**On Ben's current Arch/T2 host this is built and installed**, from a standalone
+repo at `~/dev/projects/appletbdrm-fix` (a patched out-of-tree build of the exact
 v7.0.12 driver + DKMS). It adds `appletbdrm_recover_endpoints()` — drain the
 stale/late IN-endpoint data (and `usb_clear_halt` a stalled endpoint) after any
 flush error so the next flush starts clean — plus a fix for a latent
@@ -95,6 +95,12 @@ the bar staying live. Installed via DKMS so it survives kernel updates. See that
 repo's README for the build/test/install and the kernel-update caveat (a future
 `linux-t2` DRM-API bump would need the patch refreshed; the failure is graceful,
 falling back to the stock module).
+
+This tiny-dfr repository does not vendor or pin that external kernel patch, so
+a fresh deployment must not assume endpoint recovery is active. Before relying
+on it, verify `cat /sys/module/appletbdrm/parameters/recover` prints `1`; a
+missing parameter or `0` means the stock/userspace recovery ladder still
+applies. Build and installation steps belong to the external repo's README.
 
 ## References
 

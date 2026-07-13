@@ -24,7 +24,7 @@ const BUTTON_RADIUS_PX: f64 = 8.0;
 
 #[derive(Default)]
 pub(crate) struct NowPlayingRenderer {
-    cached_art_path: Option<String>,
+    cached_art_media: Option<NowPlaying>,
     cached_art: Option<ImageSurface>,
     last_bounds: Option<WidgetBounds>,
     bounds_generation: u64,
@@ -60,7 +60,7 @@ impl NowPlayingRenderer {
             return Vec::new();
         }
 
-        let has_art = self.art_for(media.art_path.as_deref()).is_some();
+        let has_art = self.art_for(media).is_some();
         let measured_text_width = measure_text_width(c, media);
         let Some(widget_width) = widget_width_for(region_width, has_art, measured_text_width)
         else {
@@ -139,13 +139,17 @@ impl NowPlayingRenderer {
         self.last_bounds.is_some() && token == self.bounds_generation
     }
 
-    fn art_for(&mut self, path: Option<&str>) -> Option<&ImageSurface> {
-        let path_changed = self.cached_art_path.as_deref() != path;
-        if path_changed || (path.is_some() && self.cached_art.is_none()) {
-            self.cached_art_path = path.map(str::to_string);
-            self.cached_art = path.and_then(load_art);
+    fn art_for(&mut self, media: &NowPlaying) -> Option<&ImageSurface> {
+        if self.art_cache_needs_reload(media) {
+            self.cached_art_media = Some(media.clone());
+            self.cached_art = media.art_path.as_deref().and_then(load_art);
         }
         self.cached_art.as_ref()
+    }
+
+    fn art_cache_needs_reload(&self, media: &NowPlaying) -> bool {
+        self.cached_art_media.as_ref() != Some(media)
+            || (media.art_path.is_some() && self.cached_art.is_none())
     }
 
     fn set_bounds(&mut self, bounds: Option<WidgetBounds>) {
@@ -471,6 +475,31 @@ mod tests {
         let token = renderer.touch_token(180.0, 30.0).unwrap();
         renderer.set_bounds(None);
         assert!(!renderer.token_is_current(token));
+    }
+
+    #[test]
+    fn art_cache_reloads_when_media_changes_at_a_stable_path() {
+        let path = Some("/run/tiny-dfr-ben/media/current.png".to_string());
+        let first = NowPlaying {
+            title: "First track".to_string(),
+            artist: "Artist".to_string(),
+            art_path: path.clone(),
+        };
+        let second = NowPlaying {
+            title: "Second track".to_string(),
+            artist: "Artist".to_string(),
+            art_path: path,
+        };
+        let mut renderer = NowPlayingRenderer {
+            cached_art_media: Some(first.clone()),
+            cached_art: Some(ImageSurface::create(Format::ARgb32, 1, 1).unwrap()),
+            ..Default::default()
+        };
+
+        assert!(!renderer.art_cache_needs_reload(&first));
+        assert!(renderer.art_cache_needs_reload(&second));
+        renderer.cached_art = None;
+        assert!(renderer.art_cache_needs_reload(&first));
     }
 
     fn png_header(width: u32, height: u32) -> Vec<u8> {

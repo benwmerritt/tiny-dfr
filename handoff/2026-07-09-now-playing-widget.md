@@ -35,7 +35,7 @@ critters used to own), between the workspace strip and the control groups:
 Commits: 834b9d9 (render) → cd8d02a, ce114ef, 1628dc3, 886f698, 8268908
 (art sharing, alignment, frame, sizing, padding) → 90c4e82 (tap-to-focus)
 → 3a9a53f (hide under overlays) → 4d851c7 (device-loss fix, below).
-Daemon tests: 112 (`cargo test`; pre-commit hook runs the full gates).
+Daemon tests: 113 (`cargo test`; pre-commit hook runs the full gates).
 
 ## The 2026-07-06 incident (why the bar is/was dead)
 
@@ -132,8 +132,10 @@ all?" Full write-up: **`docs/appletbdrm-wedge.md`**. Short version:
   (`MIN_FLUSH_INTERVAL`, ~30 Hz) that coalesces all redraws and collapses a
   slider drag's 100+/s per-event flush storm into ~30/s with the same tight
   damage. Applies to every redraw source, not just the parked critters.
-- **Actual cure since built (2026-07-09): a kernel-side driver fix**, in its
-  own repo at `~/dev/projects/appletbdrm-fix` (patched appletbdrm + DKMS). It
+- **Ben-host kernel fix (built 2026-07-09):** Ben's current machine has a
+  patched appletbdrm + DKMS build from `~/dev/projects/appletbdrm-fix`. This
+  tiny-dfr repo does not vendor or pin that external patch, so fresh installs
+  must not assume it is active. The patch
   resynchronizes the USB endpoints after a failed flush so a `-110` recovers
   instead of wedging permanently. Validated on hardware and DKMS-installed
   (survives kernel updates). Details: `docs/appletbdrm-wedge.md`. With this in

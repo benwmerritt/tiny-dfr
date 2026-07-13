@@ -6,6 +6,9 @@ Date: 2026-07-02 (evening). Supersedes `2026-07-02-overlay-continuation-handoff.
 > (now-playing widget, the 2026-07-06 USB wedge post-mortem, device-loss
 > crash fix, recovery-ladder amendments). Architecture and deploy sections
 > below still apply.
+> For recovery, use the newer handoff: the ladder below predates the config-1
+> and unconfigured-device findings. Those states require a full power-off, not
+> its warm-reboot fallback.
 
 ## What is live on hardware (all Ben-verified)
 
