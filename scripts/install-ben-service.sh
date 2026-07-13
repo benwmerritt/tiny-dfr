@@ -17,16 +17,16 @@ EOF
   exit 1
 fi
 
-manager_version="$(systemctl show --property=Version --value 2>/dev/null || true)"
-if [[ "$manager_version" =~ ^([0-9]+)([^0-9].*)?$ ]]; then
-  systemd_version="${BASH_REMATCH[1]}"
-else
-  systemd_version=""
-fi
-if [[ -z "$systemd_version" ]] || (( systemd_version < 254 )); then
+restart_steps_cap="$(
+  systemctl show systemd-journald.service --property=RestartSteps --value 2>/dev/null || true
+)"
+restart_max_delay_cap="$(
+  systemctl show systemd-journald.service --property=RestartMaxDelayUSec --value 2>/dev/null || true
+)"
+if [[ ! "$restart_steps_cap" =~ ^[0-9]+$ ]] || [[ -z "$restart_max_delay_cap" ]]; then
   cat >&2 <<EOF
-tiny-dfr-ben requires systemd 254 or newer for bounded restart backoff
-(RestartSteps= and RestartMaxDelaySec=). Running manager: ${manager_version:-unknown}.
+tiny-dfr-ben requires a running systemd manager with RestartSteps= and
+RestartMaxDelaySec= support (systemd 254 or newer).
 Refusing to install a unit that could fall back to a 2-second restart loop.
 EOF
   exit 1
