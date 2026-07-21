@@ -28,6 +28,18 @@ the half-drawn sprite is stuck on a dead screen.
 So this is **not** a critter-logic bug. It's a display-throughput ceiling that
 the current render cadence exceeds.
 
+> **Root cause since found (2026-07-09): `docs/appletbdrm-wedge.md`.** It is not
+> a rate/queue ceiling at all — every flush is a blocking ~1 s USB handshake,
+> and the driver never resynchronizes after a `-110` timeout, so one unlucky
+> late response desyncs the stream permanently. That is why the 10 fps
+> merged-damage build still wedged: cadence only changes the *odds* of hitting
+> the timeout, not whether a hit is survivable. Userspace can lower the odds
+> (fewer round-trips, tighter damage) but cannot prevent it; the real fix is
+> kernel-side resync in appletbdrm. The general flush throttle now in
+> `src/main.rs` (`MIN_FLUSH_INTERVAL`) applies this odds-reduction to all
+> redraws, not just critters — but re-enabling critters still needs the
+> kernel-side fix (or acceptance of the wedge risk).
+
 ## How it's disabled
 
 - Config flag `EnableCritters` (PascalCase in TOML), added in `src/config.rs`,

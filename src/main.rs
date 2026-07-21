@@ -37,6 +37,7 @@ use std::{
     },
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
+    process,
     time::{Duration, Instant},
 };
 use udev::MonitorBuilder;
@@ -49,6 +50,7 @@ mod fonts;
 mod helper_link;
 mod helper_proto;
 mod layout;
+mod now_playing;
 mod pixel_shift;
 mod sliders;
 
@@ -58,11 +60,12 @@ use config::{ButtonConfig, Config, SliderTarget, WorkspacesCfg};
 use critters::CritterField;
 use display::DrmBackend;
 use helper_link::HelperLink;
-use helper_proto::{Intent, WsEntry};
+use helper_proto::{Intent, NowPlaying, WsEntry, HELPER_SOCKET_PATH};
 use layout::{
     button_spans, controls_region, hit_in_spans, hit_index, strip_layout, ButtonSpan, LayoutSpec,
     RegionGeometry, CONTROL_SPACING_PX as BUTTON_SPACING_PX,
 };
+use now_playing::{NowPlayingLayout, NowPlayingRenderer};
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 use sliders::SliderBackends;
 
@@ -81,6 +84,52 @@ const SLIDER_EMIT_INTERVAL: Duration = Duration::from_millis(50);
 // touches and forces a complete redraw); latest pending model wins. The real
 // helper debounces at 40ms, so this only bounds hostile/buggy senders.
 const STRIP_STRUCTURAL_MIN_INTERVAL: Duration = Duration::from_millis(100);
+// Minimum interval between DRM flushes to the Touch Bar display. Every flush is
+// a blocking ~1 s request/response USB handshake in appletbdrm; the wedge fires
+// when the T2 misses that deadline (kernel `-110`) and the driver never
+// resynchronizes, desyncing the stream permanently (recoverable only by USB
+// reset or power-off). This is a driver/firmware fault, NOT a userspace rate or
+// overlap bug (DIRTYFB is already serialized by the modeset locks, and the
+// ioctl returns 0 even on `-110`, so we get no backpressure signal). We cannot
+// prevent the wedge from here — but each flush is an independent dice-roll on
+// that timeout, so capping the flush rate cuts the number of round-trips a fast
+// slider drag would otherwise fire (one per libinput event) and lowers the
+// odds. Coalescing keeps per-flush damage tight (the other lever). ~30 Hz stays
+// smooth for sliders; see docs/appletbdrm-wedge.md for the full analysis.
+const MIN_FLUSH_INTERVAL: Duration = Duration::from_millis(33);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlushDecision {
+    Idle,
+    Wait(Duration),
+    Flush,
+}
+
+#[derive(Default)]
+struct FlushThrottle {
+    last_flush: Option<Instant>,
+}
+
+impl FlushThrottle {
+    fn decide(&self, redraw_pending: bool, now: Instant) -> FlushDecision {
+        if !redraw_pending {
+            return FlushDecision::Idle;
+        }
+        let Some(last_flush) = self.last_flush else {
+            return FlushDecision::Flush;
+        };
+        let elapsed = now.saturating_duration_since(last_flush);
+        if elapsed >= MIN_FLUSH_INTERVAL {
+            FlushDecision::Flush
+        } else {
+            FlushDecision::Wait(MIN_FLUSH_INTERVAL - elapsed)
+        }
+    }
+
+    fn record_flush(&mut self, now: Instant) {
+        self.last_flush = Some(now);
+    }
+}
 
 // A horizontal pill (rounded-ends rectangle) path; caller fills.
 fn draw_pill(c: &Context, x: f64, y: f64, width: f64, height: f64) {
@@ -656,8 +705,15 @@ impl Button {
         match &self.image {
             ButtonImage::Text(text) => {
                 let extents = c.text_extents(text).unwrap();
+                // Center on the advance width (the glyph's cell), not the ink
+                // box. The label font is monospace (Adwaita Mono), which places
+                // each glyph within its fixed cell by design — e.g. "1" gets a
+                // wide right bearing so its stroke lands at the cell centre.
+                // Centering the ink box instead fights that and leaves "1"
+                // looking shifted; centering the cell honours the design.
                 c.move_to(
-                    button_left_edge + (button_width as f64 / 2.0 - extents.width() / 2.0).round(),
+                    button_left_edge
+                        + (button_width as f64 / 2.0 - extents.x_advance() / 2.0).round(),
                     y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round(),
                 );
                 c.show_text(text).unwrap();
@@ -1385,10 +1441,11 @@ impl FunctionLayer {
     }
 
     // The empty middle between the strip and the visible controls — the pet
-    // Claudes' enclosure. None when this layer has no span worth wandering
-    // (Classic layers, or a wide anchored overlay covering the middle).
+    // Claudes' enclosure and now-playing slot. None when this layer has no
+    // span worth wandering, or while an overlay is open and the middle acts
+    // as the tap-outside-to-close zone.
     fn free_region(&self, bar_width: i32) -> Option<(f64, f64)> {
-        if self.kind != LayerKind::Regions {
+        if self.kind != LayerKind::Regions || self.has_open_overlay() {
             return None;
         }
         let strip = strip_layout(&self.strip_groups, 0.0).region;
@@ -1396,6 +1453,11 @@ impl FunctionLayer {
         let start = strip.origin + strip.width as f64 + 24.0;
         let end = controls.origin - 24.0;
         (end - start >= 80.0).then_some((start, end))
+    }
+
+    fn visible_controls_origin(&self, bar_width: i32) -> Option<f64> {
+        (self.kind == LayerKind::Regions)
+            .then(|| self.controls_geometry(self.visible(), bar_width).origin)
     }
 
     // Rebuild the strip from a helper model (empty = restore the static
@@ -2003,6 +2065,17 @@ mod function_layer_tests {
     }
 
     #[test]
+    fn free_region_hides_while_overlay_is_open() {
+        let mut layer = regions_layer(4);
+
+        assert!(layer.free_region(BAR_WIDTH as i32).is_some());
+        assert!(layer.open_overlay("canary", None));
+        assert_eq!(layer.free_region(BAR_WIDTH as i32), None);
+        assert!(layer.close_all_overlays());
+        assert!(layer.free_region(BAR_WIDTH as i32).is_some());
+    }
+
+    #[test]
     fn anchored_overlay_hits_at_the_anchor_not_the_right_edge() {
         let mut layer = regions_layer(4);
         assert!(layer.open_overlay("canary", Some(800.0)));
@@ -2307,6 +2380,33 @@ OpenOverlay = "volume""#,
             Some((SliderTarget::Volume, 0.3))
         );
         assert_eq!(throttle.flush(SliderTarget::Volume, t_flush), None);
+    }
+
+    #[test]
+    fn display_flush_throttle_waits_for_the_boundary_and_keeps_pending_work() {
+        let mut throttle = FlushThrottle::default();
+        let t0 = Instant::now();
+
+        assert_eq!(throttle.decide(false, t0), FlushDecision::Idle);
+        assert_eq!(throttle.decide(true, t0), FlushDecision::Flush);
+        // Merely deciding to flush does not consume pending work. The caller
+        // records only after the DRM dirty ioctl has actually been issued.
+        assert_eq!(throttle.decide(true, t0), FlushDecision::Flush);
+        let completed_at = t0 + Duration::from_millis(100);
+        throttle.record_flush(completed_at);
+
+        assert_eq!(
+            throttle.decide(true, completed_at + Duration::from_millis(32)),
+            FlushDecision::Wait(Duration::from_millis(1))
+        );
+        assert_eq!(
+            throttle.decide(true, completed_at + MIN_FLUSH_INTERVAL),
+            FlushDecision::Flush
+        );
+        assert_eq!(
+            throttle.decide(false, completed_at + MIN_FLUSH_INTERVAL),
+            FlushDecision::Idle
+        );
     }
 
     #[test]
@@ -2774,23 +2874,47 @@ fn drain_touches<K, F>(
     K: Eq + std::hash::Hash,
     F: AsRawFd,
 {
-    for (_, (layer, set, btn)) in touches.drain() {
-        if let Some(button) = layers[layer].button_mut_in_set(&set, btn) {
-            button.set_active(uinput, false);
-            // An aborted drag must not leave `dragging` stranded true, or
-            // sync_sliders would refuse to re-seed this slider until the
-            // next completed drag on it.
-            if let Some(state) = button.slider_state_mut() {
-                if state.dragging {
-                    state.dragging = false;
-                    button.changed = true;
-                }
+    for (_, touch) in touches.drain() {
+        release_button_touch(layers, uinput, touch);
+    }
+}
+
+fn release_tracked_touch<K, F>(
+    layers: &mut [FunctionLayer; 2],
+    touches: &mut HashMap<K, (usize, ButtonSetKey, usize)>,
+    uinput: &mut UInputHandle<F>,
+    seat_slot: &K,
+) where
+    K: Eq + std::hash::Hash,
+    F: AsRawFd,
+{
+    if let Some(touch) = touches.remove(seat_slot) {
+        release_button_touch(layers, uinput, touch);
+    }
+}
+
+fn release_button_touch<F>(
+    layers: &mut [FunctionLayer; 2],
+    uinput: &mut UInputHandle<F>,
+    (layer, set, btn): (usize, ButtonSetKey, usize),
+) where
+    F: AsRawFd,
+{
+    if let Some(button) = layers[layer].button_mut_in_set(&set, btn) {
+        button.set_active(uinput, false);
+        // An aborted drag must not leave `dragging` stranded true, or
+        // sync_sliders would refuse to re-seed this slider until the next
+        // completed drag on it.
+        if let Some(state) = button.slider_state_mut() {
+            if state.dragging {
+                state.dragging = false;
+                button.changed = true;
             }
         }
-        // An unresolvable set here must only ever hold already-released
-        // entries: any path that makes a set unreachable (strip generation
-        // bump, config reload) is required to drain BEFORE the change.
     }
+    // An unresolvable set here must only ever hold already-released entries:
+    // any path that makes a set unreachable (strip generation bump, config
+    // reload) is required to drain BEFORE the change.
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2889,11 +3013,27 @@ where
 }
 
 fn main() {
-    let mut drm = DrmBackend::open_card().unwrap();
+    // No card yet is the normal boot race (niri briefly holds DRM master) or
+    // the post-wedge state (bar re-enumerated HID-only): exit quietly and let
+    // the service's patient restart keep trying, without a panic backtrace
+    // every 2s in the journal.
+    let mut drm = match DrmBackend::open_card() {
+        Ok(drm) => drm,
+        Err(err) => {
+            eprintln!("{err}");
+            process::exit(1);
+        }
+    };
     let (height, width) = drm.mode().size();
     let _ = panic::catch_unwind(AssertUnwindSafe(|| real_main(&mut drm)));
     let crash_bitmap = include_bytes!("crash_bitmap.raw");
-    let mut map = drm.map().unwrap();
+    // If real_main died because the touchbar's USB device vanished, the card
+    // is unwritable: there is nothing to show the crash bitmap on. Exit so
+    // systemd restarts us; the daemon reattaches when the bar re-enumerates.
+    let Ok(mut map) = drm.map() else {
+        eprintln!("touchbar DRM device is gone; exiting for service restart");
+        process::exit(1);
+    };
     let data = map.as_mut();
     let mut wptr = 0;
     for byte in crash_bitmap {
@@ -2908,7 +3048,10 @@ fn main() {
         }
     }
     drop(map);
-    drm.dirty(&[ClipRect::new(0, 0, height, width)]).unwrap();
+    if drm.dirty(&[ClipRect::new(0, 0, height, width)]).is_err() {
+        eprintln!("touchbar DRM device is gone; exiting for service restart");
+        process::exit(1);
+    }
     let mut sigset = SigSet::empty();
     sigset.add(Signal::SIGTERM);
     sigset.wait().unwrap();
@@ -2932,14 +3075,13 @@ fn real_main(drm: &mut DrmBackend) {
     // The helper socket also needs root (bind + chown inside the root-owned
     // RuntimeDirectory). Missing directory (e.g. stock unit without
     // RuntimeDirectory=) degrades to fallback-strip-only operation.
-    let mut helper_link =
-        match HelperLink::bind(Path::new("/run/tiny-dfr-ben/helper.sock"), cfg.helper_uid) {
-            Ok(link) => Some(link),
-            Err(e) => {
-                eprintln!("helper socket unavailable: {e:#}");
-                None
-            }
-        };
+    let mut helper_link = match HelperLink::bind(Path::new(HELPER_SOCKET_PATH), cfg.helper_uid) {
+        Ok(link) => Some(link),
+        Err(e) => {
+            eprintln!("helper socket unavailable: {e:#}");
+            None
+        }
+    };
 
     // drop privileges to input and video group
     let groups = ["input", "video"];
@@ -3009,6 +3151,7 @@ fn real_main(drm: &mut DrmBackend) {
 
     let mut digitizer: Option<InputDevice> = None;
     let mut touches = HashMap::new();
+    let mut now_playing_touches: HashMap<u32, u64> = HashMap::new();
     // Seed any sliders visible at startup (base-layer sliders would otherwise
     // render at 0.0 until the first overlay transition).
     for layer in layers.iter_mut() {
@@ -3025,12 +3168,16 @@ fn real_main(drm: &mut DrmBackend) {
     let mut helper_fresh = false;
     let mut pending_strip_model: Option<Vec<Vec<WsEntry>>> = None;
     let mut last_structural_apply: Option<Instant> = None;
+    let mut flush_throttle = FlushThrottle::default();
     let mut critter_field = CritterField::default();
+    let mut now_playing_renderer = NowPlayingRenderer::default();
+    let mut now_playing: Option<NowPlaying> = None;
     loop {
         if cfg_mgr.reload_pending() {
             // Release in-flight touches against the outgoing layers before
             // they are dropped, or their key-down events would be stranded.
             drain_touches(&mut layers, &mut touches, &mut uinput);
+            now_playing_touches.clear();
             let parts = cfg_mgr.load_config(width);
             cfg = parts.0;
             layers = parts.1;
@@ -3102,6 +3249,12 @@ fn real_main(drm: &mut DrmBackend) {
                     Vec::new()
                 });
                 let volume = fresh.then(|| link.state().vol).flatten().map(|v| v.level);
+                let media = fresh.then(|| link.state().media.clone()).flatten();
+                if media != now_playing {
+                    now_playing_touches.clear();
+                    now_playing = media;
+                    needs_complete_redraw = true;
+                }
                 // Pet-Claude census: one critter per session while fresh.
                 // Parked behind EnableCritters (default off) — the animation
                 // wedges the USB display; see .scratch/claude-critter/.
@@ -3145,6 +3298,7 @@ fn real_main(drm: &mut DrmBackend) {
             });
             if !structural || interval_elapsed {
                 if apply_helper_strip(&mut layers, &mut touches, &mut uinput, &model) {
+                    now_playing_touches.clear();
                     needs_complete_redraw = true;
                     last_structural_apply = Some(now);
                 }
@@ -3174,9 +3328,39 @@ fn real_main(drm: &mut DrmBackend) {
         // Advance the pet Claudes while they're visible: the free middle
         // region exists (Regions layer active), sessions are running, and
         // the bar is lit. Frames ride the epoll timeout like pixel shift.
-        let critter_region = layers[active_layer].free_region(width as i32);
+        let shift = if cfg.enable_pixel_shift {
+            pixel_shift.get()
+        } else {
+            (0.0, 0.0)
+        };
+        let pixel_shift_width = if cfg.enable_pixel_shift {
+            PIXEL_SHIFT_WIDTH_PX as i32
+        } else {
+            0
+        };
+        let effective_width = width as i32 - pixel_shift_width;
+        let x_offset = shift.0 + pixel_shift_width as f64 / 2.0;
+        let critter_region = layers[active_layer]
+            .free_region(effective_width)
+            .map(|(start, end)| (start + x_offset, end + x_offset));
+        let controls_origin = layers[active_layer]
+            .visible_controls_origin(effective_width)
+            .map(|origin| origin + x_offset);
+        let now_playing_visible = now_playing.is_some() && critter_region.is_some();
+        if now_playing_visible {
+            if let Some(wait) =
+                now_playing_renderer.art_retry_wait(now_playing.as_ref(), Instant::now())
+            {
+                if wait.is_zero() {
+                    needs_complete_redraw = true;
+                } else {
+                    next_timeout_ms = min(next_timeout_ms, wait.as_millis().max(1) as i32);
+                }
+            }
+        }
         let critters_visible = cfg.enable_critters
             && critter_region.is_some()
+            && !now_playing_visible
             && !critter_field.is_empty()
             && backlight.current_bl() > 0;
         let mut critters_dirty = false;
@@ -3192,15 +3376,22 @@ fn real_main(drm: &mut DrmBackend) {
         }
 
         let layer_dirty = needs_complete_redraw || layers[active_layer].any_button_changed();
-        if layer_dirty
+        let want_redraw = layer_dirty
             || critters_dirty
-            || (cfg.enable_critters && !critters_visible && critter_field.needs_erase())
-        {
-            let shift = if cfg.enable_pixel_shift {
-                pixel_shift.get()
-            } else {
-                (0.0, 0.0)
-            };
+            || (cfg.enable_critters && !critters_visible && critter_field.needs_erase());
+        // Rate-limit the flush to the display (see MIN_FLUSH_INTERVAL). When a
+        // redraw would come sooner than the interval after the last one, hold
+        // it: the pending damage is preserved for free because draw() has not
+        // consumed the button-changed flags and needs_complete_redraw is still
+        // set, so the next flush after the interval renders everything that
+        // changed meanwhile in a single dirty() ioctl — collapsing a burst of
+        // per-event flushes into one round-trip with the same tight damage.
+        let flush_now = Instant::now();
+        let flush_decision = flush_throttle.decide(want_redraw, flush_now);
+        if let FlushDecision::Wait(wait) = flush_decision {
+            next_timeout_ms = min(next_timeout_ms, wait.as_millis().max(1) as i32);
+        }
+        if flush_decision == FlushDecision::Flush {
             let complete = needs_complete_redraw;
             let mut clips = if layer_dirty {
                 layers[active_layer].draw(
@@ -3214,13 +3405,27 @@ fn real_main(drm: &mut DrmBackend) {
             } else {
                 Vec::new()
             };
-            // Critters paint after the layer so they sit on the (empty)
-            // middle; render also erases last frame's spans. Gated off by
-            // default (EnableCritters) — see .scratch/claude-critter/.
+            let c = Context::new(&surface).unwrap();
+            c.translate(height as f64, 0.0);
+            c.rotate((90.0f64).to_radians());
+            if complete {
+                clips.extend(now_playing_renderer.render(
+                    &c,
+                    height as i32,
+                    width as i32,
+                    NowPlayingLayout {
+                        region: critter_region,
+                        controls_origin,
+                        y_shift: shift.1,
+                    },
+                    now_playing.as_ref(),
+                ));
+            }
+            // Critters paint after the layer and now-playing widget so they
+            // sit on the remaining middle; render also erases last frame's
+            // spans. Gated off by default (EnableCritters) — see
+            // .scratch/claude-critter/.
             if cfg.enable_critters {
-                let c = Context::new(&surface).unwrap();
-                c.translate(height as f64, 0.0);
-                c.rotate((90.0f64).to_radians());
                 clips.extend(critter_field.render(
                     &c,
                     height as i32,
@@ -3236,6 +3441,7 @@ fn real_main(drm: &mut DrmBackend) {
             let data = surface.data().unwrap();
             drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
             drm.dirty(&clips).unwrap();
+            flush_throttle.record_flush(Instant::now());
             needs_complete_redraw = false;
         }
 
@@ -3281,6 +3487,7 @@ fn real_main(drm: &mut DrmBackend) {
                         };
                         if active_layer != new_layer {
                             drain_touches(&mut layers, &mut touches, &mut uinput);
+                            now_playing_touches.clear();
                             layers[active_layer].close_all_overlays();
                             active_layer = new_layer;
                             needs_complete_redraw = true;
@@ -3297,6 +3504,20 @@ fn real_main(drm: &mut DrmBackend) {
                         TouchEvent::Down(dn) => {
                             let x = dn.x_transformed(width as u32);
                             let y = dn.y_transformed(height as u32);
+                            let now_playing_token = now_playing
+                                .as_ref()
+                                .and_then(|_| now_playing_renderer.touch_token(x, y));
+                            if let Some(token) = now_playing_token {
+                                release_tracked_touch(
+                                    &mut layers,
+                                    &mut touches,
+                                    &mut uinput,
+                                    &dn.seat_slot(),
+                                );
+                                now_playing_touches.insert(dn.seat_slot(), token);
+                                continue;
+                            }
+                            now_playing_touches.remove(&dn.seat_slot());
                             match layers[active_layer].hit_target(width, height, x, y) {
                                 HitOutcome::Button(button_set, btn) => {
                                     // Workspace taps while an overlay is open
@@ -3308,21 +3529,12 @@ fn real_main(drm: &mut DrmBackend) {
                                     // pairing, but don't let a duplicate Down
                                     // overwrite a live entry with its key
                                     // still down.
-                                    if let Some((old_layer, old_set, old_btn)) =
-                                        touches.remove(&dn.seat_slot())
-                                    {
-                                        if let Some(button) =
-                                            layers[old_layer].button_mut_in_set(&old_set, old_btn)
-                                        {
-                                            button.set_active(&mut uinput, false);
-                                            if let Some(state) = button.slider_state_mut() {
-                                                if state.dragging {
-                                                    state.dragging = false;
-                                                    button.changed = true;
-                                                }
-                                            }
-                                        }
-                                    }
+                                    release_tracked_touch(
+                                        &mut layers,
+                                        &mut touches,
+                                        &mut uinput,
+                                        &dn.seat_slot(),
+                                    );
                                     if let Some(target) =
                                         layers[active_layer].slider_target_at(&button_set, btn)
                                     {
@@ -3382,6 +3594,7 @@ fn real_main(drm: &mut DrmBackend) {
                                 // release cannot activate anything.
                                 HitOutcome::OutsideControls => {
                                     drain_touches(&mut layers, &mut touches, &mut uinput);
+                                    now_playing_touches.clear();
                                     if layers[active_layer].close_all_overlays() {
                                         layers[active_layer].sync_sliders(
                                             &slider_backends,
@@ -3394,6 +3607,14 @@ fn real_main(drm: &mut DrmBackend) {
                             }
                         }
                         TouchEvent::Motion(mtn) => {
+                            if now_playing_touches.contains_key(&mtn.seat_slot()) {
+                                let x = mtn.x_transformed(width as u32);
+                                let y = mtn.y_transformed(height as u32);
+                                if !now_playing_renderer.hit_test(x, y) {
+                                    now_playing_touches.remove(&mtn.seat_slot());
+                                }
+                                continue;
+                            }
                             if !touches.contains_key(&mtn.seat_slot()) {
                                 continue;
                             }
@@ -3443,6 +3664,16 @@ fn real_main(drm: &mut DrmBackend) {
                             }
                         }
                         TouchEvent::Up(up) => {
+                            if let Some(token) = now_playing_touches.remove(&up.seat_slot()) {
+                                if now_playing.is_some()
+                                    && now_playing_renderer.token_is_current(token)
+                                {
+                                    if let Some(link) = helper_link.as_mut() {
+                                        link.send_intent(&epoll, &Intent::FocusNowPlaying);
+                                    }
+                                }
+                                continue;
+                            }
                             if !touches.contains_key(&up.seat_slot()) {
                                 continue;
                             }
@@ -3487,6 +3718,7 @@ fn real_main(drm: &mut DrmBackend) {
                                         .map(|(left, _)| left);
                                     if layers[layer].activate_button_action(action, anchor) {
                                         drain_touches(&mut layers, &mut touches, &mut uinput);
+                                        now_playing_touches.clear();
                                         layers[layer].sync_sliders(
                                             &slider_backends,
                                             helper_volume(&helper_link, Instant::now()),
@@ -3499,6 +3731,7 @@ fn real_main(drm: &mut DrmBackend) {
                         // A canceled touch must release its key and leave the
                         // map, exactly like Up, but never activates anything.
                         TouchEvent::Cancel(cancel) => {
+                            now_playing_touches.remove(&cancel.seat_slot());
                             if let Some((layer, button_set, btn)) =
                                 touches.remove(&cancel.seat_slot())
                             {

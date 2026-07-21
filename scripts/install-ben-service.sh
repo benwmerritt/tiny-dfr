@@ -17,6 +17,21 @@ EOF
   exit 1
 fi
 
+restart_steps_cap="$(
+  systemctl show systemd-journald.service --property=RestartSteps --value 2>/dev/null || true
+)"
+restart_max_delay_cap="$(
+  systemctl show systemd-journald.service --property=RestartMaxDelayUSec --value 2>/dev/null || true
+)"
+if [[ ! "$restart_steps_cap" =~ ^[0-9]+$ ]] || [[ -z "$restart_max_delay_cap" ]]; then
+  cat >&2 <<EOF
+tiny-dfr-ben requires a running systemd manager with RestartSteps= and
+RestartMaxDelaySec= support (systemd 254 or newer).
+Refusing to install a unit that could fall back to a 2-second restart loop.
+EOF
+  exit 1
+fi
+
 repo_root="${TINY_DFR_FORK_DIR:-/home/ben/dev/projects/tiny-dfr}"
 archdots_root="${ARCHDOTS_DIR:-/home/ben/archdots}"
 # TINY_DFR_BINARY overrides which build gets installed (used by
@@ -56,8 +71,10 @@ No appletbdrm Touch Bar DRM card is present.
 Refusing to stop or switch services because tiny-dfr would otherwise scan the
 normal i915 display card and fail with "Device or resource busy" while Niri owns it.
 This usually means the Touch Bar USB display did not come back in DFR mode after
-suspend/resume. Use the safe path: reboot and retry once /dev/dri/card* includes
-an appletbdrm card. Do not force-switch USB config from this script.
+suspend/resume. Check its 05ac:8302 bConfigurationValue: config 1 or an
+unconfigured device needs a full power-off (~30s off), not a warm reboot. Retry
+only once /dev/dri/card* includes an appletbdrm card. Never force-switch USB
+configuration from this script.
 EOF
   exit 1
 fi
@@ -102,10 +119,26 @@ cat >/etc/systemd/system/tiny-dfr-ben.service <<'EOF'
 Description=Tiny Apple T2 Mac Touch Bar daemon (Ben fork)
 After=graphical.target systemd-logind.service dev-tiny_dfr_backlight.device dev-tiny_dfr_display_backlight.device
 Wants=dev-tiny_dfr_backlight.device dev-tiny_dfr_display_backlight.device
+# At boot the compositor (niri) briefly holds DRM master on every card,
+# including the appletbdrm Touch Bar, so the daemon's first starts fail with
+# "Device or resource busy" and exits. Disable the start-rate limit so it
+# never gives up; the restart delay below backs off if the card stays absent.
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/local/bin/tiny-dfr-ben
+# Treat ten seconds of uninterrupted runtime as healthy. The PID check keeps
+# an early exit from reaching the reset; a healthy run returns the service
+# restart counter to RestartSec.
+ExecStartPost=/usr/bin/sleep 10
+ExecStartPost=/usr/bin/kill -0 $MAINPID
+ExecStartPost=/usr/bin/systemctl reset-failed tiny-dfr-ben.service
 Restart=always
+# Retry promptly for the normal boot race, then exponentially back off to five
+# minutes for a persistent config-1/unconfigured device or program failure.
+RestartSec=2
+RestartSteps=8
+RestartMaxDelaySec=5min
 
 # Hosts the helper socket (chowned to the helper uid, mode 0600, bound
 # pre-privdrop). RuntimeDirectory is exempt from ProtectSystem=strict.
@@ -140,7 +173,7 @@ if [[ -x "$repo_root/scripts/unwedge-touchbar.sh" ]]; then
     && [[ "$(awk '{print $3}' "/proc/$main_pid/stat" 2>/dev/null)" == D* ]]; then
     echo "tiny-dfr-ben (pid $main_pid) is wedged in D-state; resetting the Touch Bar display first."
     "$repo_root/scripts/unwedge-touchbar.sh" || {
-      echo "Unwedge failed; aborting before a restart that would hang. A reboot may be needed." >&2
+      echo "Unwedge failed; follow its recovery verdict. Config 1/unconfigured requires a full power-off, not a warm reboot." >&2
       exit 1
     }
   fi
@@ -180,7 +213,7 @@ else
   systemctl --no-pager --lines=50 status tiny-dfr-ben.service || true
   rollback_to_stock
   if ! systemctl is-active --quiet tiny-dfr.service; then
-    echo "Stock tiny-dfr did not become active either; a reboot is the safest recovery." >&2
+    echo "Stock tiny-dfr did not become active either. If the DRM card is absent, fully power off for ~30s; a warm reboot does not clear config 1." >&2
     systemctl --no-pager --lines=50 status tiny-dfr.service || true
   fi
   exit 1

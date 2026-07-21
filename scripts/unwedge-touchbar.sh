@@ -82,16 +82,24 @@ for _ in $(seq 1 20); do
 done
 
 # No appletbdrm card came back. The usual cause: the device re-attached in USB
-# configuration 1 (HID-only). The DRM *display* lives in configuration 2, which
-# the kernel selects at boot but not always after a hot re-auth. We must NOT
-# write bConfigurationValue to force it — that force-switch is forbidden on this
-# machine (it can harden the wedge until reboot). A reboot is the safe recovery.
+# configuration 1 (HID-only), or is stuck unconfigured. The DRM *display* lives
+# in configuration 2, which the kernel selects at boot but not always after a
+# hot re-auth. We must NOT write bConfigurationValue to force it — that
+# force-switch is forbidden on this machine (it can harden the wedge).
+#
+# IMPORTANT (learned 2026-07-09): a warm reboot does NOT clear this. The Touch
+# Bar lives on the T2 coprocessor, which keeps its hung USB state across a
+# `systemctl reboot`. Recovery needs a FULL POWER-OFF: shut down, leave it off
+# ~30s so the T2 de-powers, then cold-boot. If a plain power-off fails, do an
+# SMC reset (shut down; hold right-Shift + left-Control + left-Option 7s; add
+# the power button for another 7s; release; then boot).
 cfg="$(cat "$usb_dev/bConfigurationValue" 2>/dev/null || echo '?')"
 if [[ "$cfg" != 2 ]]; then
-  echo "Display re-attached in USB config $cfg (no DRM display interface present)." >&2
-  echo "The display mode only returns on reboot; config-switching is forbidden here." >&2
+  echo "Display re-attached in USB config '$cfg' (no DRM display interface present)." >&2
+  echo "The display mode only returns on a full power-off; config-switching is forbidden here." >&2
 else
-  echo "Device is in config 2 but appletbdrm did not rebind; reboot to recover." >&2
+  echo "Device is in config 2 but appletbdrm did not rebind; full power-off to recover." >&2
 fi
-echo "REBOOT to recover. Any already-installed tiny-dfr-ben binary will run on boot." >&2
+echo "FULL POWER-OFF to recover (a warm reboot is NOT enough — the T2 keeps the" >&2
+echo "hung state). Shut down, ~30s off, cold boot. Any installed tiny-dfr-ben runs on boot." >&2
 exit 1

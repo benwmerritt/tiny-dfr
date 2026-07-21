@@ -1,6 +1,13 @@
 # tiny-dfr
 The most basic dynamic function row daemon possible
 
+> **This is Ben's experimental fork** (workspace strip, overlay control
+> groups, sliders, Now Playing widget for an Arch/T2 MacBook). Fork docs:
+> [FORK.md](FORK.md); shipped state and recovery: newest file in
+> [handoff/](handoff/); vocabulary: [CONTEXT.md](CONTEXT.md); helper
+> protocol: [docs/helper-protocol.md](docs/helper-protocol.md).
+> Upstream is [AsahiLinux/tiny-dfr](https://github.com/AsahiLinux/tiny-dfr).
+
 
 ## Dependencies
 cairo, libinput, freetype, fontconfig, librsvg 2.59 or later, uinput enabled in kernel config

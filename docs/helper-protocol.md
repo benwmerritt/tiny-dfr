@@ -22,8 +22,10 @@ intent was added so taps can jump across monitors.
 ## Framing
 
 - NDJSON: one JSON object per line, UTF-8, `\n`-terminated.
-- **Max 4096 bytes per line.** Receiver treats an overlong line as a protocol
-  error (a legitimate `state` is comfortably under 1 KiB).
+- **Max 16384 bytes per line.** Receiver treats an overlong line as a protocol
+  error. The cap accommodates a snapshot at every documented field/count bound
+  while keeping buffering strictly limited; normal helper snapshots are much
+  smaller.
 - **Must-ignore rule**: unknown *fields* in a known message are silently
   ignored (the forward-compatibility seam — e.g. a future
   `"claude": {"on": true}` presence field rides `state` with no version
@@ -52,7 +54,8 @@ intent was added so taps can jump across monitors.
                           {"id":9,"idx":2,"occ":true,"foc":true}]},
    {"name":"DP-3","ws":[{"id":3,"idx":1,"occ":true,"foc":false}]}
  ],
- "vol":{"level":0.60,"muted":false}}
+ "vol":{"level":0.60,"muted":false},
+ "media":{"title":"Song Name","artist":"Artist","art_path":"/run/tiny-dfr-ben/media/art-0123456789abcdef.png"}}
 ```
 
 - `outs` (array, required): one group per output, in a **stable,
@@ -80,6 +83,23 @@ intent was added so taps can jump across monitors.
   (receiver truncates to 64 chars, renders at most 6 critters). Strictly
   render-input: critters have no hit targets and can never trigger keys,
   sysfs writes, or intents. Absent → no critters.
+- `media` (object or absent): now-playing render input, present only while
+  something is actively playing. `title` is required after trimming; empty
+  title means no widget. `artist` is optional. Both strings are control-char
+  stripped and truncated by the daemon (`title` ≤ 96 chars, `artist` ≤ 80).
+  `art_path` is optional and must be a direct-child, helper-prepared local PNG
+  under `/run/tiny-dfr-ben/media/`; remote artwork URLs are
+  helper input only, never daemon input. The daemon never fetches URLs,
+  decodes embedded image bytes, or follows arbitrary user-provided paths.
+  The daemon opens art nonblocking without following symlinks, accepts only
+  regular files ≤ 2 MiB with dimensions ≤ 512×512, and renders invalid/missing
+  art as text-only. Lifecycle note:
+  `/run/tiny-dfr-ben` is the daemon's systemd RuntimeDirectory, so the
+  media dir (and any prepared art) vanishes whenever the daemon is down
+  and is recreated by the daemon on start. After creation, the media
+  subdirectory's Unix owner is `HelperUid`; "daemon-managed" refers only to
+  its creation and RuntimeDirectory-bound lifecycle. An empty/missing art dir
+  while the service is restarting is normal.
 - **Full snapshots only, no deltas**: any single message fully repairs the
   daemon's view after drops or reconnects.
 - Sent: (a) debounced (~40 ms) on any derived-state change, (b) every **2 s**
@@ -120,18 +140,33 @@ intent was added so taps can jump across monitors.
   volume latest-wins slot, so a tap can't be coalesced away by a concurrent
   drag. No acks: the resulting niri event → fresh `state` is the ack.
 
+`focus-now-playing`:
+
+```json
+{"t":"focus-now-playing"}
+```
+
+- Payload-free intent emitted only when a physical touch starts and releases
+  on the now-playing widget.
+- The helper resolves the currently playing MPRIS player with `playerctl`,
+  matches it to a live Niri window `app_id`, and focuses that window with
+  `niri msg action focus-window --id <id>`. Unknown or stale player/window
+  matches are logged and dropped.
+- This does not execute player-provided commands or URLs; the daemon never
+  receives a process id, command line, or arbitrary window id from state.
+
 ## Robustness rules
 
 - The daemon never crashes on socket input: parse errors, out-of-range or
   non-finite numbers, and oversize lines are dropped and counted. After **8
-  consecutive** invalid lines, any line > 4096 bytes, or > **200 msg/s**
+  consecutive** invalid lines, any line > 16384 bytes, or > **200 msg/s**
   sustained over 1 s, the daemon closes the connection. The counter resets on
   any valid message.
 - **Staleness**: state is stale when no client is connected or no valid
   `state` arrived for **6 s** (three missed heartbeats). Stale → the strip
   falls back to the static `[1]` button (plain `Alt+Num1` uinput keys, no
-  helper needed) and the volume slider goes inert. Freshness returning
-  restores the live strip.
+  helper needed), the now-playing widget hides, and the volume slider goes
+  inert. Freshness returning restores live render state.
 - **Echo-fight rule**: while a volume-slider touch is active, the daemon
   ignores incoming `vol` for rendering (the finger wins) and resumes tracking
   pushed state on touch-up.
@@ -143,11 +178,11 @@ intent was added so taps can jump across monitors.
 ## Explicit non-goals
 
 No brightness messages (daemon-local sysfs), no key or command execution, no
-config, no queries/RPC. The intent set is exactly
-`{set-volume, focus-workspace}` — **typed, helper-validated, and originating
-only from physical touch**; state is render-input only and never triggers
-key emission, sysfs writes, or execution. Anything not specified here is
-invalid.
+config, no queries/RPC, and no media-control intents in v1. The intent set is
+exactly `{set-volume, focus-workspace, focus-now-playing}` — **typed,
+helper-validated, and originating only from physical touch**; state is
+render-input only and never triggers key emission, sysfs writes, MPRIS calls,
+network fetches, or execution. Anything not specified here is invalid.
 
 Threat note: a process that can write this socket already runs as uid 1000
 and could call `wpctl`/`niri msg action` directly — the protocol grants

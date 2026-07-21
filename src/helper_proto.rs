@@ -1,18 +1,26 @@
 use serde::Deserialize;
-use std::time::{Duration, Instant};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 // Wire types and validation for the helper protocol (docs/helper-protocol.md,
 // v1). Everything arriving on the socket is untrusted input into a
 // root-adjacent process: parsing is serde into fixed shapes, bounds are
 // enforced here, and the caller never sees an unsanitized state.
 
-pub const MAX_LINE_BYTES: usize = 4096;
+pub const MAX_LINE_BYTES: usize = 16 * 1024;
 pub const MAX_GROUPS: usize = 4;
 pub const MAX_WS_PER_GROUP: usize = 16;
 pub const MAX_WS_IDX: u8 = 32;
 pub const MAX_CLAUDE_SESSIONS: usize = 8;
 pub const MAX_SESSION_ID_LEN: usize = 64;
+pub const MAX_MEDIA_TITLE_CHARS: usize = 96;
+pub const MAX_MEDIA_ARTIST_CHARS: usize = 80;
+pub const MAX_MEDIA_ART_PATH_CHARS: usize = 512;
 pub const SUPPORTED_VERSION: u64 = 1;
+pub const HELPER_SOCKET_PATH: &str = "/run/tiny-dfr-ben/helper.sock";
+pub const MEDIA_ART_DIR: &str = "/run/tiny-dfr-ben/media";
 const MAX_CONSECUTIVE_INVALID: u32 = 8;
 const MAX_MSGS_PER_WINDOW: u32 = 200;
 const RATE_WINDOW: Duration = Duration::from_secs(1);
@@ -35,6 +43,10 @@ pub struct StateMsg {
     // Pet-Claude presence: one critter per running Claude Code session.
     #[serde(default)]
     pub claude: Option<ClaudePresence>,
+    // Render-only now-playing metadata. The helper owns MPRIS/user-session
+    // access; the daemon only paints this when the helper state is fresh.
+    #[serde(default)]
+    pub media: Option<NowPlaying>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -47,6 +59,16 @@ pub struct ClaudePresence {
 pub struct ClaudeSession {
     #[serde(default)]
     pub id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct NowPlaying {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default)]
+    pub art_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -114,13 +136,45 @@ pub fn sanitize_state(mut state: StateMsg) -> StateMsg {
             }
         }
     }
+    if let Some(media) = &mut state.media {
+        media.title = clean_media_text(&media.title, MAX_MEDIA_TITLE_CHARS);
+        media.artist = clean_media_text(&media.artist, MAX_MEDIA_ARTIST_CHARS);
+        media.art_path = media.art_path.take().and_then(clean_media_art_path);
+        if media.title.is_empty() {
+            state.media = None;
+        }
+    }
     state
+}
+
+fn clean_media_text(value: &str, max_chars: usize) -> String {
+    let without_controls: String = value.chars().filter(|ch| !ch.is_control()).collect();
+    without_controls
+        .trim()
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+fn clean_media_art_path(value: String) -> Option<String> {
+    let value = value.trim();
+    let path = Path::new(value);
+    if value.len() > MAX_MEDIA_ART_PATH_CHARS
+        || path.extension().and_then(|ext| ext.to_str()) != Some("png")
+        || path.parent() != Some(Path::new(MEDIA_ART_DIR))
+    {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Intent {
     SetVolume(f64),
     FocusWorkspace(u64),
+    FocusNowPlaying,
 }
 
 pub fn encode_intent(intent: &Intent) -> String {
@@ -136,6 +190,7 @@ pub fn encode_intent(intent: &Intent) -> String {
         Intent::FocusWorkspace(id) => {
             format!("{{\"t\":\"focus-workspace\",\"id\":{id}}}\n")
         }
+        Intent::FocusNowPlaying => "{\"t\":\"focus-now-playing\"}\n".to_string(),
     }
 }
 
@@ -259,6 +314,125 @@ mod tests {
     }
 
     #[test]
+    fn media_state_parses_and_sanitizes() {
+        let state = parse_line(
+            r#"{"t":"state","outs":[],"media":{"title":"  Song\u0007 Name  ","artist":"Artist","art_path":"/run/tiny-dfr-ben/media/current.png","future":true}}"#,
+        )
+        .unwrap();
+        let HelperMessage::State(state) = state else {
+            panic!("expected state");
+        };
+
+        let state = sanitize_state(state);
+        let media = state.media.unwrap();
+        assert_eq!(media.title, "Song Name");
+        assert_eq!(media.artist, "Artist");
+        assert_eq!(
+            media.art_path.as_deref(),
+            Some("/run/tiny-dfr-ben/media/current.png")
+        );
+    }
+
+    #[test]
+    fn media_sanitizer_drops_empty_titles_and_unsafe_art_paths() {
+        let state = sanitize_state(StateMsg {
+            outs: vec![],
+            vol: None,
+            claude: None,
+            media: Some(NowPlaying {
+                title: "   ".to_string(),
+                artist: "Artist".to_string(),
+                art_path: Some("/run/tiny-dfr-ben/media/current.png".to_string()),
+            }),
+        });
+        assert!(state.media.is_none());
+
+        let state = sanitize_state(StateMsg {
+            outs: vec![],
+            vol: None,
+            claude: None,
+            media: Some(NowPlaying {
+                title: "Track".to_string(),
+                artist: "Artist".to_string(),
+                art_path: Some("/home/ben/.cache/private.png".to_string()),
+            }),
+        });
+        assert_eq!(state.media.unwrap().art_path, None);
+
+        let state = sanitize_state(StateMsg {
+            outs: vec![],
+            vol: None,
+            claude: None,
+            media: Some(NowPlaying {
+                title: "Track".to_string(),
+                artist: "Artist".to_string(),
+                art_path: Some("/tmp/tiny-dfr-ben/current.png".to_string()),
+            }),
+        });
+        assert_eq!(state.media.unwrap().art_path, None);
+
+        let state = sanitize_state(StateMsg {
+            outs: vec![],
+            vol: None,
+            claude: None,
+            media: Some(NowPlaying {
+                title: "Track".to_string(),
+                artist: "Artist".to_string(),
+                art_path: Some("/run/tiny-dfr-ben/media/nested/current.png".to_string()),
+            }),
+        });
+        assert_eq!(state.media.unwrap().art_path, None);
+    }
+
+    #[test]
+    fn media_sanitizer_removes_controls_before_trimming() {
+        let state = sanitize_state(StateMsg {
+            outs: vec![],
+            vol: None,
+            claude: None,
+            media: Some(NowPlaying {
+                title: "\u{7}   \u{7}".to_string(),
+                artist: "\u{7}  Artist  \u{7}".to_string(),
+                art_path: None,
+            }),
+        });
+        assert!(state.media.is_none());
+
+        let state = sanitize_state(StateMsg {
+            outs: vec![],
+            vol: None,
+            claude: None,
+            media: Some(NowPlaying {
+                title: "\u{7}  Track  \u{7}".to_string(),
+                artist: "\u{7}  Artist  \u{7}".to_string(),
+                art_path: None,
+            }),
+        });
+        let media = state.media.unwrap();
+        assert_eq!(media.title, "Track");
+        assert_eq!(media.artist, "Artist");
+    }
+
+    #[test]
+    fn media_sanitizer_truncates_text_fields() {
+        let state = sanitize_state(StateMsg {
+            outs: vec![],
+            vol: None,
+            claude: None,
+            media: Some(NowPlaying {
+                title: "t".repeat(MAX_MEDIA_TITLE_CHARS + 20),
+                artist: "a".repeat(MAX_MEDIA_ARTIST_CHARS + 20),
+                art_path: Some("/run/tiny-dfr-ben/media/current.jpg".to_string()),
+            }),
+        });
+
+        let media = state.media.unwrap();
+        assert_eq!(media.title.len(), MAX_MEDIA_TITLE_CHARS);
+        assert_eq!(media.artist.len(), MAX_MEDIA_ARTIST_CHARS);
+        assert_eq!(media.art_path, None);
+    }
+
+    #[test]
     fn sanitize_enforces_group_and_entry_bounds() {
         let groups = (0..6)
             .map(|g| OutputGroup {
@@ -277,6 +451,7 @@ mod tests {
             outs: groups,
             vol: None,
             claude: None,
+            media: None,
         });
 
         assert_eq!(state.outs.len(), MAX_GROUPS);
@@ -320,6 +495,7 @@ mod tests {
                 muted: false,
             }),
             claude: None,
+            media: None,
         });
 
         let ws = &state.outs[0].ws;
@@ -341,6 +517,7 @@ mod tests {
                     })
                     .collect(),
             }),
+            media: None,
         });
 
         let sessions = &state.claude.unwrap().sessions;
@@ -377,6 +554,7 @@ mod tests {
             ],
             vol: None,
             claude: None,
+            media: None,
         });
 
         assert_eq!(state.outs.len(), 1);
@@ -396,6 +574,10 @@ mod tests {
         assert_eq!(
             encode_intent(&Intent::FocusWorkspace(9)),
             "{\"t\":\"focus-workspace\",\"id\":9}\n"
+        );
+        assert_eq!(
+            encode_intent(&Intent::FocusNowPlaying),
+            "{\"t\":\"focus-now-playing\"}\n"
         );
     }
 
@@ -423,6 +605,34 @@ mod tests {
         let mut terminated = vec![b'y'; MAX_LINE_BYTES + 1];
         terminated.push(b'\n');
         assert_eq!(buf.push(&terminated), Err(LineOverflow));
+    }
+
+    #[test]
+    fn maximum_bounded_state_fits_line_buffer() {
+        let entry = r#"{"id":18446744073709551615,"idx":32,"occ":true,"foc":true}"#;
+        let group = format!(r#"{{"name":"eDP-1","ws":[{}]}}"#, vec![entry; 16].join(","));
+        let session = format!(r#"{{"id":"{}"}}"#, "s".repeat(MAX_SESSION_ID_LEN));
+        let art_prefix = "/run/tiny-dfr-ben/media/";
+        let art_path = format!(
+            "{art_prefix}{}.png",
+            "p".repeat(MAX_MEDIA_ART_PATH_CHARS - art_prefix.len() - 4)
+        );
+        let line = format!(
+            r#"{{"t":"state","outs":[{}],"claude":{{"sessions":[{}]}},"media":{{"title":"{}","artist":"{}","art_path":"{}"}}}}
+"#,
+            vec![group; MAX_GROUPS].join(","),
+            vec![session; MAX_CLAUDE_SESSIONS].join(","),
+            "t".repeat(MAX_MEDIA_TITLE_CHARS),
+            "a".repeat(MAX_MEDIA_ARTIST_CHARS),
+            art_path,
+        );
+        assert!(line.len() > 4096);
+        assert!(line.len() <= MAX_LINE_BYTES);
+
+        let mut buf = LineBuffer::new();
+        let lines = buf.push(line.as_bytes()).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(parse_line(&lines[0]).is_ok());
     }
 
     #[test]
