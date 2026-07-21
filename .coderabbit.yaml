@@ -1,0 +1,6 @@
+# CodeRabbit reviews every non-draft PR automatically; the skip-review label opts out.
+reviews:
+  auto_review:
+    enabled: true
+    drafts: false
+    labels: ["!skip-review"]
